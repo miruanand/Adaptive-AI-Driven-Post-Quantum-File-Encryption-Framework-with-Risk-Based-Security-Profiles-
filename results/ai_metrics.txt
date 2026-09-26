@@ -1,0 +1,37 @@
+AI RISK MODEL METRICS (synthetic policy-labelled data)
+============================================================
+Samples: 8000 (train=6400, test=1600)
+Accuracy:  0.8950
+Precision (weighted): 0.8948
+Recall (weighted):    0.8950
+F1 (weighted):        0.8945
+
+Confusion matrix (rows=true, cols=pred), labels=['LOW', 'MEDIUM', 'HIGH', 'CRITICAL']
+[146, 39, 0, 0]
+[34, 1050, 42, 0]
+[0, 48, 229, 0]
+[0, 0, 5, 7]
+
+Classification report:
+              precision    recall  f1-score   support
+
+         LOW       0.81      0.79      0.80       185
+      MEDIUM       0.92      0.93      0.93      1126
+        HIGH       0.83      0.83      0.83       277
+    CRITICAL       1.00      0.58      0.74        12
+
+    accuracy                           0.90      1600
+   macro avg       0.89      0.78      0.82      1600
+weighted avg       0.89      0.90      0.89      1600
+
+Feature importances:
+  sensitivity: 0.2932
+  threat_level: 0.2074
+  access_risk: 0.1491
+  external_sharing: 0.0805
+  personal_data: 0.0970
+  financial_data: 0.0525
+  confidential_keywords: 0.0683
+  file_size_mb_log: 0.0519
+
+NOTE: Labels are generated from a transparent weighted policy formula (see docstring), not from manually labelled real-world data. These metrics validate that the classifier learned the policy's decision boundary, NOT that the policy reflects real-world risk.
