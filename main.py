@@ -10,7 +10,8 @@ This is a SINGLE-FILE consolidation of the full pipeline described in the
 project brief:
 
     FILE -> Feature Extraction -> AI Risk Assessment -> Risk Score/Class
-         -> Security Profile Selection -> AES-256-GCM + ML-KEM (hybrid)
+         -> Security Profile Selection -> ChaCha20-Poly1305 / AES-256-GCM
+            with conventional keys (LOW/MEDIUM) or ML-KEM keys (HIGH/CRITICAL)
          -> Encrypted File -> Decryption -> SHA-256 Integrity Check
          -> Benchmarking / Results
 
@@ -52,7 +53,21 @@ Included and actually executed/tested in this environment:
   - Feature extraction (txt/csv/json/md/log/xml/pdf/docx)
   - Synthetic-policy-labelled dataset generation + RandomForest risk model
   - Risk-based security profile selection
-  - Hybrid ML-KEM + HKDF-SHA256 + AES-256-GCM encryption/decryption
+  - Profile-driven encryption/decryption:
+      LOW      ChaCha20-Poly1305 + conventional key
+      MEDIUM   AES-256-GCM       + conventional key management (wrapped keys)
+      HIGH     AES-256-GCM       + ML-KEM-768  (PQC key establishment)
+      CRITICAL AES-256-GCM       + ML-KEM-1024 (PQC key establishment)
+  - Risk-driven KEY EXPIRY + CRYPTO-SHREDDING: each tier has a key lifetime
+    (LOW none, MEDIUM 90 d, HIGH 30 d, CRITICAL 7 d by default). When it
+    ends the per-file key material is destroyed, so the file can never be
+    decrypted again - even by someone holding the master / ML-KEM keys.
+  - RISK-SCALED SELF-DESTRUCT: guarded tiers need a passphrase and tolerate only
+    a few wrong ones (MEDIUM 20, HIGH 10, CRITICAL 3); when the budget is used
+    up the file's key is crypto-shredded immediately.
+  - KEY-COMMITTING container (v3): a 256-bit key commitment is verified before
+    the AEAD runs, so one ciphertext can never be opened by two different keys
+    (AES-GCM / ChaCha20-Poly1305 alone do not guarantee this).
   - SHA-256 integrity verification
   - A benchmark command (CSV/JSON output, mean+std over repetitions)
   - A self-test command covering the core security validation cases
@@ -74,14 +89,18 @@ from __future__ import annotations
 import argparse
 import base64
 import csv
+import hmac
 import json
 import math
 import os
+import secrets
 import re  # noqa: F811 (kept here; used throughout feature extraction below)
 import statistics
 import sys
+import threading
 import time
 import traceback
+import uuid
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Optional
@@ -111,7 +130,7 @@ for _d in (MODELS_DIR, KEYS_DIR, UPLOADS_DIR, ENCRYPTED_DIR, DECRYPTED_DIR, RESU
 
 MODEL_PATH = MODELS_DIR / "risk_model.joblib"
 RANDOM_SEED = 42
-CONTAINER_VERSION = 1
+CONTAINER_VERSION = 3   # v3 adds key commitment + key expiry; v1 and v2 containers are still readable
 
 RISK_CLASSES = ["LOW", "MEDIUM", "HIGH", "CRITICAL"]
 FEATURE_NAMES = [
@@ -181,19 +200,53 @@ def kem_decaps(algo: str, dk: bytes, ciphertext: bytes):
 # 2. KEY MANAGEMENT
 # --------------------------------------------------------------------------
 
+class KeyStoreError(RuntimeError):
+    """A required key is missing or malformed in the local key store."""
+
+
+class KeyShreddedError(KeyStoreError):
+    """The file's key material has expired or been destroyed (crypto-shredded)."""
+
+
+class PassphraseRequiredError(KeyStoreError):
+    """The file is guarded by an attempt budget and needs a passphrase."""
+
+
+class WrongPassphraseError(KeyStoreError):
+    """Wrong passphrase; `remaining` attempts are left before the key self-destructs."""
+    def __init__(self, msg: str, remaining: int):
+        super().__init__(msg)
+        self.remaining = remaining
+
+
 class KeyManager:
     """
     Academic-prototype key storage: raw key bytes on the local filesystem.
 
+    Three kinds of key material live under keys/:
+      * ML-KEM key pairs  (keys/ML-KEM-768_ek.bin, _dk.bin, ...)   -> HIGH / CRITICAL
+      * a master key      (keys/master_kek.bin)                    -> MEDIUM
+        (wraps a fresh random file key for every file: envelope encryption)
+      * per-file keys     (keys/conventional/<key_id>.key)         -> LOW
+        (a fresh random 256-bit key per file, referenced by key_id)
+
     SECURITY CAVEAT (documented, not hidden): this is NOT suitable for
     production. A real deployment needs secure key storage (HSM / KMS),
     access control, key rotation, and authenticated key retrieval.
+    Losing the keys/ folder means LOW / MEDIUM / HIGH / CRITICAL files can
+    no longer be decrypted - back it up.
     """
+
+    # key_id values come from the container file, which is untrusted input
+    # (users upload .pqc files to /decrypt). Only accept exactly what we
+    # generate, so a crafted key_id can never point outside keys/conventional.
+    _KEY_ID_RE = re.compile(r"[0-9a-f]{32}")
 
     def __init__(self, keys_dir: Path = KEYS_DIR):
         self.keys_dir = keys_dir
         self.keys_dir.mkdir(parents=True, exist_ok=True)
 
+    # ---- ML-KEM key pairs (HIGH / CRITICAL) ---------------------------
     def _paths(self, algo: str):
         safe = algo.replace("/", "_")
         return (self.keys_dir / f"{safe}_ek.bin", self.keys_dir / f"{safe}_dk.bin")
@@ -218,9 +271,221 @@ class KeyManager:
             self.ensure_keypair(algo)
         return dk_path.read_bytes()
 
+    # ---- conventional keys (LOW / MEDIUM) -----------------------------
+    @staticmethod
+    def _write_secret(path: Path, data: bytes):
+        path.write_bytes(data)
+        try:
+            os.chmod(path, 0o600)  # best effort; mostly a no-op on Windows
+        except OSError:
+            pass
+
+    def master_kek(self, create: bool = True) -> bytes:
+        """
+        The master key-encryption key used by the MEDIUM profile.
+        Created on first use when encrypting. When decrypting, pass
+        create=False so a missing master key is reported instead of being
+        silently replaced by a brand-new (useless) one.
+        """
+        path = self.keys_dir / "master_kek.bin"
+        if not path.exists():
+            if not create:
+                raise KeyStoreError(
+                    "Master key (keys/master_kek.bin) not found - this file was "
+                    "encrypted with a different keys/ folder or the folder was deleted."
+                )
+            self._write_secret(path, os.urandom(32))
+        kek = path.read_bytes()
+        if len(kek) != 32:
+            raise KeyStoreError("keys/master_kek.bin is corrupt (expected 32 bytes).")
+        return kek
+
+    def new_conventional_key(self) -> tuple:
+        """Create + store a fresh random 256-bit key for one file (LOW profile)."""
+        key_id = uuid.uuid4().hex
+        key = os.urandom(32)
+        conv_dir = self.keys_dir / "conventional"
+        conv_dir.mkdir(parents=True, exist_ok=True)
+        self._write_secret(conv_dir / f"{key_id}.key", key)
+        return key_id, key
+
+    def load_conventional_key(self, key_id) -> bytes:
+        if not isinstance(key_id, str) or not self._KEY_ID_RE.fullmatch(key_id):
+            raise KeyStoreError("Invalid key_id in container.")
+        path = self.keys_dir / "conventional" / f"{key_id}.key"
+        if not path.exists():
+            self._raise_missing(key_id)
+        key = path.read_bytes()
+        if len(key) != 32:
+            raise KeyStoreError(f"Stored key {key_id} is corrupt (expected 32 bytes).")
+        return key
+
+    # ---- per-file shred keys + expiry ledger (key expiry / crypto-shredding) --
+    #
+    # A "shred key" is a random 256-bit secret kept ONLY in keys/shred/<id>.key.
+    # For MEDIUM / HIGH / CRITICAL files with an expiry, the file key is derived
+    # from (master key | ML-KEM secret) AND the shred key. Destroying the shred
+    # key makes the file undecryptable even for someone who still holds the
+    # master key or the ML-KEM private key. For LOW files the per-file
+    # conventional key itself is the thing that gets destroyed.
+    #
+    # keys/expiry_ledger.json records id -> expiry / status so that a sweep can
+    # destroy keys on time and decrypt can say "shredded" rather than "missing".
+
+    _LEDGER_LOCK = threading.RLock()
+
+    @property
+    def _ledger_path(self) -> Path:
+        return self.keys_dir / "expiry_ledger.json"
+
+    def _read_ledger(self) -> dict:
+        try:
+            data = json.loads(self._ledger_path.read_text())
+            return data if isinstance(data, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    def _write_ledger(self, ledger: dict):
+        tmp = self._ledger_path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(ledger, indent=2))
+        os.replace(tmp, self._ledger_path)
+
+    def ledger(self) -> dict:
+        with self._LEDGER_LOCK:
+            return self._read_ledger()
+
+    def new_shred_key(self) -> tuple:
+        shred_id = uuid.uuid4().hex
+        key = os.urandom(32)
+        d = self.keys_dir / "shred"
+        d.mkdir(parents=True, exist_ok=True)
+        self._write_secret(d / f"{shred_id}.key", key)
+        return shred_id, key
+
+    def load_shred_key(self, shred_id) -> bytes:
+        if not isinstance(shred_id, str) or not self._KEY_ID_RE.fullmatch(shred_id):
+            raise KeyStoreError("Invalid shred_id in container.")
+        path = self.keys_dir / "shred" / f"{shred_id}.key"
+        if not path.exists():
+            self._raise_missing(shred_id)
+        key = path.read_bytes()
+        if len(key) != 32:
+            raise KeyStoreError(f"Stored shred key {shred_id} is corrupt (expected 32 bytes).")
+        return key
+
+    def _raise_missing(self, key_id: str):
+        entry = self.ledger().get(key_id)
+        if entry and entry.get("status") == "SHREDDED":
+            when = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(entry.get("shredded_at", 0)))
+            raise KeyShreddedError(
+                f"The key for this file was crypto-shredded at {when} "
+                f"({entry.get('reason', 'expired')}). The data is permanently unrecoverable."
+            )
+        raise KeyStoreError(
+            f"No stored key for id {key_id} - this file was encrypted with "
+            "a different keys/ folder or the folder was deleted."
+        )
+
+    # fields that must never be shown through the web API
+    _PRIVATE_LEDGER_FIELDS = ("pw_verifier", "commitment")
+
+    def public_ledger(self) -> dict:
+        return {k: {f: v for f, v in e.items() if f not in self._PRIVATE_LEDGER_FIELDS}
+                for k, e in self.ledger().items()}
+
+    def register_expiry(self, key_id: str, created_at: float, expires_at: Optional[float],
+                        label: str, profile_name: str, key_mode: str,
+                        max_attempts: Optional[int] = None,
+                        pw_verifier: Optional[bytes] = None,
+                        commitment: Optional[bytes] = None):
+        with self._LEDGER_LOCK:
+            ledger = self._read_ledger()
+            entry = {
+                "label": label, "profile": profile_name, "key_mode": key_mode,
+                "created_at": created_at, "expires_at": expires_at, "status": "ACTIVE",
+            }
+            if max_attempts:
+                entry.update({
+                    "max_attempts": int(max_attempts), "failed_attempts": 0,
+                    "pw_verifier": _b64e(pw_verifier), "commitment": _b64e(commitment),
+                })
+            ledger[key_id] = entry
+            self._write_ledger(ledger)
+
+    def record_failed_attempt(self, key_id: str, now: Optional[float] = None) -> tuple:
+        """Count one wrong passphrase. Returns (attempts_left, key_destroyed).
+        When the budget is used up the key material is crypto-shredded."""
+        with self._LEDGER_LOCK:
+            ledger = self._read_ledger()
+            e = ledger[key_id]
+            e["failed_attempts"] = int(e.get("failed_attempts", 0)) + 1
+            left = int(e["max_attempts"]) - e["failed_attempts"]
+            self._write_ledger(ledger)
+            if left <= 0:
+                self.shred(key_id, reason="attempt budget exhausted", now=now)
+                return 0, True
+            return left, False
+
+    def reset_attempts(self, key_id: str):
+        with self._LEDGER_LOCK:
+            ledger = self._read_ledger()
+            e = ledger.get(key_id)
+            if e and e.get("failed_attempts"):
+                e["failed_attempts"] = 0
+                self._write_ledger(ledger)
+
+    @staticmethod
+    def _overwrite_and_delete(path: Path) -> bool:
+        """Best-effort secure delete: overwrite with random bytes, fsync, unlink.
+        NOTE: on SSDs / journaling or copy-on-write filesystems, overwriting
+        is not a guarantee - the real protection is that the key was never
+        stored anywhere else (see README caveats)."""
+        if not path.exists():
+            return False
+        try:
+            size = path.stat().st_size
+            with open(path, "r+b") as f:
+                f.write(os.urandom(max(size, 32)))
+                f.flush()
+                os.fsync(f.fileno())
+        except OSError:
+            pass
+        path.unlink()
+        return True
+
+    def shred(self, key_id: str, reason: str = "manual", now: Optional[float] = None) -> bool:
+        """Destroy the key material for `key_id` (idempotent). Returns True if
+        something was destroyed."""
+        if not isinstance(key_id, str) or not self._KEY_ID_RE.fullmatch(key_id):
+            raise KeyStoreError("Invalid key id.")
+        destroyed = False
+        with self._LEDGER_LOCK:
+            destroyed |= self._overwrite_and_delete(self.keys_dir / "shred" / f"{key_id}.key")
+            destroyed |= self._overwrite_and_delete(self.keys_dir / "conventional" / f"{key_id}.key")
+            ledger = self._read_ledger()
+            entry = ledger.get(key_id)
+            if entry is not None and entry.get("status") != "SHREDDED":
+                entry.update({"status": "SHREDDED", "shredded_at": now if now is not None else time.time(),
+                              "reason": reason})
+                self._write_ledger(ledger)
+        return destroyed
+
+    def sweep_expired(self, now: Optional[float] = None) -> list:
+        """Destroy every key whose expiry has passed. Returns the list of ids."""
+        now = now if now is not None else time.time()
+        done = []
+        with self._LEDGER_LOCK:
+            for kid, e in list(self._read_ledger().items()):
+                exp = e.get("expires_at")
+                if e.get("status") == "ACTIVE" and exp is not None and exp <= now:
+                    self.shred(kid, reason="expired", now=now)
+                    done.append(kid)
+        return done
+
     def ensure_all(self):
         for algo in _KEM_TABLE:
             self.ensure_keypair(algo)
+        self.master_kek()
 
 
 # --------------------------------------------------------------------------
@@ -946,24 +1211,105 @@ def assess_risk(file_path: Path, heuristic_model: "RiskModel",
 # --------------------------------------------------------------------------
 # 5. SECURITY PROFILES
 # --------------------------------------------------------------------------
+#
+#   Risk      Cipher               Key protection               Security
+#   --------  -------------------  ---------------------------  -----------
+#   LOW       ChaCha20-Poly1305    Conventional key             Basic
+#   MEDIUM    AES-256-GCM          Conventional key management  Strong
+#   HIGH      AES-256-GCM          ML-KEM-768  (PQC)            Very Strong
+#   CRITICAL  AES-256-GCM          ML-KEM-1024 (PQC)            Maximum
+#
+# "Conventional key"            = a fresh random 256-bit key per file, kept
+#                                 in the local key store.
+# "Conventional key management" = envelope encryption: a fresh random file
+#                                 key per file, wrapped (AES key wrap,
+#                                 RFC 3394) under a master key. Only the
+#                                 wrapped key is stored in the container.
+# "ML-KEM-xxx (PQC)"            = the file key is established with ML-KEM
+#                                 (FIPS 203) + HKDF-SHA256, so no key is
+#                                 stored at all - the container carries the
+#                                 KEM ciphertext.
+# ChaCha20-Poly1305 is the authenticated form of ChaCha20 (AEAD): it
+# encrypts AND detects tampering, same guarantee as AES-GCM.
+
+CIPHER_CHACHA = "ChaCha20-Poly1305"
+CIPHER_AES = "AES-256-GCM"
+
+KEY_MODE_CONVENTIONAL = "CONVENTIONAL"
+KEY_MODE_CONVENTIONAL_MANAGED = "CONVENTIONAL_MANAGED"
+KEY_MODE_PQC = "PQC"
+
+
+# Key-lifetime policy (crypto-period shrinks as risk rises - the direction
+# recommended by NIST SP 800-57). The values below are DEFAULTS for this
+# prototype; override per file with --ttl-seconds (0 = never expire).
+DAY = 86400
+KEY_LIFETIME_POLICY = {
+    "LOW": None,            # never expires
+    "MEDIUM": 90 * DAY,
+    "HIGH": 30 * DAY,
+    "CRITICAL": 7 * DAY,
+}
+
+
+# Attempt budget: how many WRONG passphrases a file tolerates before its key
+# self-destructs. Higher risk => fewer guesses. None = unlimited (no passphrase).
+MAX_ATTEMPTS_POLICY = {
+    "LOW": None,
+    "MEDIUM": 20,
+    "HIGH": 10,
+    "CRITICAL": 3,
+}
+
+
+def _fmt_duration(seconds: Optional[float]) -> str:
+    if not seconds:
+        return "No expiry"
+    seconds = int(seconds)
+    for unit, n in (("day", DAY), ("hour", 3600), ("minute", 60)):
+        if seconds >= n and seconds % n == 0:
+            v = seconds // n
+            return f"{v} {unit}{'s' if v != 1 else ''}"
+    return f"{seconds} seconds"
+
 
 @dataclass(frozen=True)
 class SecurityProfile:
     name: str
-    aes_algo: str
-    kem_algo: str
+    cipher: str                 # symmetric AEAD used for the file data
+    kem_algo: Optional[str]     # ML-KEM variant, or None for non-PQC profiles
+    key_mode: str               # one of the KEY_MODE_* constants
+    security_level: str
     description: str
+    ttl_seconds: Optional[int] = None   # key lifetime policy; None = keys never expire
+    max_attempts: Optional[int] = None  # wrong-passphrase budget; None = unlimited / no passphrase
+
+    @property
+    def key_lifetime(self) -> str:
+        return _fmt_duration(self.ttl_seconds)
+
+    @property
+    def key_protection(self) -> str:
+        if self.key_mode == KEY_MODE_PQC:
+            return f"{self.kem_algo} (PQC)"
+        if self.key_mode == KEY_MODE_CONVENTIONAL_MANAGED:
+            return "Conventional key management"
+        return "Conventional key"
 
 
 SECURITY_PROFILES = {
-    "LOW": SecurityProfile("LOW", "AES-256-GCM", "ML-KEM-512",
-                            "Baseline hybrid PQC protection for low-risk files."),
-    "MEDIUM": SecurityProfile("MEDIUM", "AES-256-GCM", "ML-KEM-768",
-                               "Standard hybrid PQC protection."),
-    "HIGH": SecurityProfile("HIGH", "AES-256-GCM", "ML-KEM-768",
-                             "Standard hybrid PQC protection for high-risk files."),
-    "CRITICAL": SecurityProfile("CRITICAL", "AES-256-GCM", "ML-KEM-1024",
-                                 "Maximum hybrid PQC protection for critical-risk files."),
+    "LOW": SecurityProfile(
+        "LOW", CIPHER_CHACHA, None, KEY_MODE_CONVENTIONAL, "Basic",
+        "Lightweight and efficient protection for low-risk files.", KEY_LIFETIME_POLICY["LOW"], MAX_ATTEMPTS_POLICY["LOW"]),
+    "MEDIUM": SecurityProfile(
+        "MEDIUM", CIPHER_AES, None, KEY_MODE_CONVENTIONAL_MANAGED, "Strong",
+        "Stronger confidentiality for moderately sensitive files.", KEY_LIFETIME_POLICY["MEDIUM"], MAX_ATTEMPTS_POLICY["MEDIUM"]),
+    "HIGH": SecurityProfile(
+        "HIGH", CIPHER_AES, "ML-KEM-768", KEY_MODE_PQC, "Very Strong",
+        "Strong file encryption + quantum-resistant key establishment.", KEY_LIFETIME_POLICY["HIGH"], MAX_ATTEMPTS_POLICY["HIGH"]),
+    "CRITICAL": SecurityProfile(
+        "CRITICAL", CIPHER_AES, "ML-KEM-1024", KEY_MODE_PQC, "Maximum",
+        "Strongest symmetric encryption + stronger PQC key establishment.", KEY_LIFETIME_POLICY["CRITICAL"], MAX_ATTEMPTS_POLICY["CRITICAL"]),
 }
 
 
@@ -973,121 +1319,505 @@ def select_profile(risk_class: str) -> SecurityProfile:
     return SECURITY_PROFILES[risk_class]
 
 
+def profile_to_dict(profile: SecurityProfile) -> dict:
+    d = asdict(profile)
+    d["key_protection"] = profile.key_protection
+    return d
+
+
 FIXED_BASELINE_PROFILE = SecurityProfile(
-    "FIXED", "AES-256-GCM", "ML-KEM-768", "Fixed non-adaptive baseline profile."
+    "FIXED", CIPHER_AES, "ML-KEM-768", KEY_MODE_PQC, "Fixed",
+    "Fixed non-adaptive baseline profile."
 )
 
 
 # --------------------------------------------------------------------------
-# 6. HYBRID CRYPTOGRAPHIC ENGINE
+# 6. ENCRYPTION ENGINE  (ChaCha20-Poly1305 / AES-256-GCM + key protection)
 # --------------------------------------------------------------------------
 
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM, ChaCha20Poly1305
+from cryptography.hazmat.primitives.keywrap import (
+    aes_key_wrap, aes_key_unwrap, InvalidUnwrap,
+)
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives import hashes
 import hashlib
 
 
-def _hkdf_derive_aes_key(shared_secret: bytes, info: bytes = b"adaptive-pqc-v1-aes-key") -> bytes:
-    hkdf = HKDF(algorithm=hashes.SHA256(), length=32, salt=None, info=info)
-    return hkdf.derive(shared_secret)
+class UnsupportedCipherError(ValueError):
+    pass
 
 
 class IntegrityError(Exception):
     pass
 
 
+def _hkdf_derive_aes_key(shared_secret: bytes, info: bytes = b"adaptive-pqc-v1-aes-key",
+                         salt: Optional[bytes] = None) -> bytes:
+    hkdf = HKDF(algorithm=hashes.SHA256(), length=32, salt=salt, info=info)
+    return hkdf.derive(shared_secret)
+
+
+def _new_recovery_passphrase() -> str:
+    """80-bit random passphrase, e.g. 3fa9-0c1d-77be-a210-9e4c."""
+    return "-".join(secrets.token_hex(2) for _ in range(5))
+
+
+def _derive_pw(passphrase: str, salt: bytes) -> tuple:
+    """scrypt(passphrase) -> (pw_key, verifier). pw_key is mixed into the file key;
+    verifier is what the key store compares against (independent of pw_key)."""
+    import unicodedata
+    pw = unicodedata.normalize("NFC", passphrase).encode("utf-8")
+    out = hashlib.scrypt(pw, salt=salt, n=2 ** 14, r=8, p=1, maxmem=2 ** 26, dklen=64)
+    return out[:32], out[32:]
+
+
+def _mix_salt(shred_key: Optional[bytes], pw_key: Optional[bytes]) -> Optional[bytes]:
+    if shred_key is None:
+        return None
+    if pw_key is None:
+        return shred_key
+    return hashlib.sha256(b"adaptive-pqc-v3-guard|" + shred_key + pw_key).digest()
+
+
+def _derive_subkeys(data_key: bytes, aad: bytes, nonce: bytes) -> tuple:
+    """
+    Key-committing derivation (container v3).
+
+    AES-GCM and ChaCha20-Poly1305 are NOT key-committing: one ciphertext can be
+    crafted that authenticates under two different keys (the basis of
+    partitioning-oracle attacks). To prevent that, the key material is expanded
+    into TWO independent values:
+        enc_key  - the AEAD key that actually encrypts the file
+        commit   - a 256-bit commitment to (data_key, header, nonce)
+    `commit` is stored in the container and checked, in constant time,
+    BEFORE the AEAD runs. Two different data keys cannot share a commitment
+    (HKDF-SHA256 is collision resistant), so a ciphertext can only ever be
+    opened by the key it was committed to.
+    """
+    out = HKDF(algorithm=hashes.SHA256(), length=64, salt=None,
+               info=b"adaptive-pqc-v3-subkeys|" + aad + b"|" + nonce).derive(data_key)
+    return out[:32], out[32:]
+
+
+def _make_aead(cipher: str, key: bytes):
+    if cipher == CIPHER_AES:
+        return AESGCM(key)
+    if cipher == CIPHER_CHACHA:
+        return ChaCha20Poly1305(key)
+    raise UnsupportedCipherError(f"Unsupported cipher: {cipher!r}")
+
+
+def _build_aad(version: int, cipher: str, key_mode: str, kem_algo: Optional[str],
+               created_at: Optional[int] = None, expires_at: Optional[int] = None,
+               shred_id: Optional[str] = None,
+               max_attempts: Optional[int] = None) -> bytes:
+    """
+    Associated data authenticated by the AEAD. It binds the container
+    header (cipher, key mode, KEM) to the ciphertext, so an attacker cannot
+    flip a header field (e.g. downgrade HIGH to a conventional key) without
+    decryption failing.
+    """
+    base = f"{version}|{cipher}|{key_mode}|{kem_algo or '-'}"
+    if version >= 3:
+        # expiry + shred id are authenticated too, so extending / removing an
+        # expiry date in the container header makes decryption fail.
+        base += f"|{created_at if created_at is not None else '-'}" \
+                f"|{expires_at if expires_at is not None else '-'}|{shred_id or '-'}"
+        if max_attempts:
+            base += f"|g{max_attempts}"   # attempt budget is authenticated too
+    return base.encode()
+
+
+def _aad_from_container(c: dict) -> bytes:
+    return _build_aad(c.get("version", 3), c["cipher"], c["key_mode"], c.get("kem_algo"),
+                      c.get("created_at"), c.get("expires_at"), c.get("shred_id"),
+                      c.get("max_attempts"))
+
+
+def _b64e(b: bytes) -> str:
+    return base64.b64encode(b).decode()
+
+
+def _coerce_profile(p) -> SecurityProfile:
+    """Accepts a SecurityProfile, a risk-class name, or (legacy) a bare ML-KEM name."""
+    if isinstance(p, SecurityProfile):
+        return p
+    if isinstance(p, str):
+        if p in SECURITY_PROFILES:
+            return SECURITY_PROFILES[p]
+        if p.startswith("ML-KEM-"):
+            return SecurityProfile(f"PQC-{p}", CIPHER_AES, p, KEY_MODE_PQC, "-",
+                                    "Ad-hoc PQC profile.")
+    raise UnsupportedKEMError(f"Cannot build a security profile from {p!r}")
+
+
 class CryptoEngine:
     """
-    Hybrid encryption:  ML-KEM (key encapsulation) -> shared secret
-                       -> HKDF-SHA256 -> AES-256 key -> AES-256-GCM (data)
+    Profile-driven encryption:
+
+      LOW       random file key (stored)                 -> ChaCha20-Poly1305
+      MEDIUM    random file key, wrapped by master key   -> AES-256-GCM
+      HIGH      ML-KEM-768  -> HKDF-SHA256 -> file key   -> AES-256-GCM
+      CRITICAL  ML-KEM-1024 -> HKDF-SHA256 -> file key   -> AES-256-GCM
+
+    Container v3 adds two features on top of that:
+
+      * KEY COMMITMENT   every container carries a 256-bit commitment to the
+                         file key; it is verified (constant time) before the
+                         AEAD runs, so a ciphertext cannot be opened by two keys.
+      * KEY EXPIRY /     each risk tier has a key lifetime. When it runs out
+        CRYPTO-SHREDDING the key material is destroyed (not just flagged), so
+                         the file becomes permanently unreadable.
     """
 
-    def __init__(self, key_manager: Optional[KeyManager] = None):
+    def __init__(self, key_manager: Optional[KeyManager] = None, clock=None,
+                 apply_attempt_policy: bool = True):
         self.km = key_manager or KeyManager()
+        self.clock = clock or time.time   # injectable so tests can fast-forward time
+        # False = ignore the per-tier attempt budget unless one is passed explicitly
+        self.apply_attempt_policy = apply_attempt_policy
 
-    def encrypt_bytes(self, plaintext: bytes, kem_algo: str) -> tuple[dict, dict]:
+    # ---------------------------------------------------------------- encrypt
+    def encrypt_bytes(self, plaintext: bytes, profile, ttl_seconds: Optional[int] = None,
+                      label: str = "", max_attempts: Optional[int] = None,
+                      passphrase: Optional[str] = None) -> tuple[dict, dict]:
+        """ttl_seconds:  None = profile policy, 0 = never expire, N = destroyed after N s.
+        max_attempts: None = profile policy, 0 = unlimited, N = key self-destructs after
+                      N wrong passphrases. A guarded file needs a passphrase; if none is
+                      given a random one is generated and returned ONCE in the metrics
+                      (key 'recovery_passphrase')."""
+        profile = _coerce_profile(profile)
         t0 = time.perf_counter()
-        ek = self.km.load_ek(kem_algo)
 
-        t_encaps_start = time.perf_counter()
-        shared_secret, kem_ciphertext = kem_encaps(kem_algo, ek)
-        t_encaps = time.perf_counter() - t_encaps_start
+        ttl = profile.ttl_seconds if ttl_seconds is None else (ttl_seconds or None)
+        if ttl is not None and ttl < 0:
+            raise ValueError("ttl_seconds must be >= 0")
+        if max_attempts is not None and max_attempts < 0:
+            raise ValueError("max_attempts must be >= 0")
+        if max_attempts is None:
+            budget = profile.max_attempts if self.apply_attempt_policy else None
+        else:
+            budget = max_attempts or None
+        now = int(self.clock())
+        created_at = now if ttl else None
+        expires_at = now + int(ttl) if ttl else None
 
-        aes_key = _hkdf_derive_aes_key(shared_secret)
-        aesgcm = AESGCM(aes_key)
-        nonce = os.urandom(12)
-        aad = f"{CONTAINER_VERSION}|{kem_algo}".encode()
-        ciphertext = aesgcm.encrypt(nonce, plaintext, aad)
-        sha256_hex = hashlib.sha256(plaintext).hexdigest()
-        total_time = time.perf_counter() - t0
+        recovery_passphrase = None
+        pw_key = pw_salt = verifier = None
+        if budget:
+            if not passphrase:
+                passphrase = recovery_passphrase = _new_recovery_passphrase()
+            pw_salt = os.urandom(16)
+            pw_key, verifier = _derive_pw(passphrase, pw_salt)
+        need_shred = bool(ttl) or bool(budget)
 
         container = {
             "version": CONTAINER_VERSION,
-            "kem_algo": kem_algo,
-            "aes_algo": "AES-256-GCM",
-            "nonce": base64.b64encode(nonce).decode(),
-            "kem_ciphertext": base64.b64encode(kem_ciphertext).decode(),
-            "ciphertext": base64.b64encode(ciphertext).decode(),
-            "aad": base64.b64encode(aad).decode(),
-            "sha256": sha256_hex,
+            "cipher": profile.cipher,
+            "key_mode": profile.key_mode,
+            "kem_algo": profile.kem_algo,
         }
+
+        t_key_start = time.perf_counter()
+        t_encaps = 0.0
+        key_material_len = 0
+        shred_id = None
+        if profile.key_mode == KEY_MODE_PQC:
+            ek = self.km.load_ek(profile.kem_algo)
+            t_e = time.perf_counter()
+            shared_secret, kem_ciphertext = kem_encaps(profile.kem_algo, ek)
+            t_encaps = time.perf_counter() - t_e
+            shred_key = None
+            if need_shred:
+                shred_id, shred_key = self.km.new_shred_key()
+            data_key = _hkdf_derive_aes_key(shared_secret, salt=_mix_salt(shred_key, pw_key))
+            container["kem_ciphertext"] = _b64e(kem_ciphertext)
+            key_material_len = len(kem_ciphertext)
+        elif profile.key_mode == KEY_MODE_CONVENTIONAL_MANAGED:
+            data_key = os.urandom(32)
+            wrap_key = self.km.master_kek()
+            if need_shred:
+                shred_id, shred_key = self.km.new_shred_key()
+                wrap_key = _hkdf_derive_aes_key(wrap_key, info=b"adaptive-pqc-v3-wrap",
+                                                salt=_mix_salt(shred_key, pw_key))
+            wrapped = aes_key_wrap(wrap_key, data_key)
+            container["wrapped_key"] = _b64e(wrapped)
+            key_material_len = len(wrapped)
+        elif profile.key_mode == KEY_MODE_CONVENTIONAL:
+            key_id, data_key = self.km.new_conventional_key()
+            container["key_id"] = key_id
+            if need_shred:
+                shred_id = key_id   # destroying the stored per-file key IS the shred
+            if pw_key:
+                data_key = _hkdf_derive_aes_key(data_key, info=b"adaptive-pqc-v3-pw", salt=pw_key)
+        else:
+            raise UnsupportedCipherError(f"Unknown key mode: {profile.key_mode!r}")
+        key_setup_time = time.perf_counter() - t_key_start
+
+        if shred_id:
+            container["shred_id"] = shred_id
+        if ttl:
+            container.update({"created_at": created_at, "expires_at": expires_at})
+        if budget:
+            container.update({"max_attempts": int(budget), "pw_salt": _b64e(pw_salt)})
+
+        nonce = os.urandom(12)
+        aad = _build_aad(CONTAINER_VERSION, profile.cipher, profile.key_mode, profile.kem_algo,
+                         created_at, expires_at, shred_id, budget)
+        enc_key, commitment = _derive_subkeys(data_key, aad, nonce)
+        ciphertext = _make_aead(profile.cipher, enc_key).encrypt(nonce, plaintext, aad)
+
+        container.update({
+            "nonce": _b64e(nonce),
+            "ciphertext": _b64e(ciphertext),
+            "aad": _b64e(aad),
+            "key_commitment": _b64e(commitment),
+            # NOTE: v3 deliberately stores NO plaintext hash. A cleartext
+            # SHA-256 of the plaintext would survive crypto-shredding and let
+            # anyone confirm guesses about the deleted content. The AEAD tag
+            # already provides integrity.
+        })
+
+        if shred_id:
+            self.km.register_expiry(shred_id, created_at or now, expires_at, label,
+                                    profile.name, profile.key_mode, max_attempts=budget,
+                                    pw_verifier=verifier, commitment=commitment)
+
         metrics = {
-            "encryption_time_s": total_time,
-            "kem_encapsulation_time_s": t_encaps,
+            "encryption_time_s": time.perf_counter() - t0,
+            "key_setup_time_s": key_setup_time,
+            "kem_encapsulation_time_s": t_encaps,   # 0.0 for non-PQC profiles
             "original_size_bytes": len(plaintext),
-            "encrypted_size_bytes": len(ciphertext) + len(kem_ciphertext) + len(nonce),
+            "encrypted_size_bytes": (len(ciphertext) + len(nonce) + key_material_len
+                                     + len(commitment) + (len(pw_salt) if pw_salt else 0)),
+            "key_commitment_bytes": len(commitment),
+            "key_lifetime": _fmt_duration(ttl),
+            "created_at": created_at,
+            "expires_at": expires_at,
+            "expires_at_text": (time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(expires_at))
+                                if expires_at else None),
+            "shred_id": shred_id,
+            "max_attempts": int(budget) if budget else None,
         }
+        if recovery_passphrase:
+            metrics["recovery_passphrase"] = recovery_passphrase   # shown once, never stored
         return container, metrics
 
-    def decrypt_bytes(self, container: dict) -> tuple[bytes, dict]:
+    # ---------------------------------------------------------------- decrypt
+    def decrypt_bytes(self, container: dict, passphrase: Optional[str] = None) -> tuple[bytes, dict]:
         t0 = time.perf_counter()
-        kem_algo = container["kem_algo"]
-        dk = self.km.load_dk(kem_algo)
-        nonce = base64.b64decode(container["nonce"])
-        kem_ciphertext = base64.b64decode(container["kem_ciphertext"])
-        ciphertext = base64.b64decode(container["ciphertext"])
-        aad = base64.b64decode(container["aad"])
-
-        t_decaps_start = time.perf_counter()
-        shared_secret = kem_decaps(kem_algo, dk, kem_ciphertext)
-        t_decaps = time.perf_counter() - t_decaps_start
-
-        aes_key = _hkdf_derive_aes_key(shared_secret)
-        aesgcm = AESGCM(aes_key)
+        created_at = expires_at = shred_id = commitment = None
+        max_attempts = pw_salt = None
         try:
-            plaintext = aesgcm.decrypt(nonce, ciphertext, aad)
-        except Exception as e:
-            raise IntegrityError(f"AES-GCM authentication/decryption failed: {e}") from e
+            version = container.get("version", 1)
+            if version == 1:
+                # Legacy containers (before profiles): always ML-KEM + AES-256-GCM.
+                cipher, key_mode, kem_algo = CIPHER_AES, KEY_MODE_PQC, container["kem_algo"]
+                expected_aad = f"1|{kem_algo}".encode()
+            elif version in (2, 3):
+                cipher = container["cipher"]
+                key_mode = container["key_mode"]
+                kem_algo = container.get("kem_algo")
+                if version == 2:
+                    expected_aad = _build_aad(2, cipher, key_mode, kem_algo)
+                else:
+                    created_at = container.get("created_at")
+                    expires_at = container.get("expires_at")
+                    shred_id = container.get("shred_id")
+                    max_attempts = container.get("max_attempts")
+                    for v in (created_at, expires_at):
+                        if v is not None and (not isinstance(v, int) or isinstance(v, bool)):
+                            raise ValueError("created_at / expires_at must be integers")
+                    if shred_id is not None and not isinstance(shred_id, str):
+                        raise ValueError("shred_id must be a string")
+                    if max_attempts is not None:
+                        if (not isinstance(max_attempts, int) or isinstance(max_attempts, bool)
+                                or max_attempts <= 0):
+                            raise ValueError("max_attempts must be a positive integer")
+                        pw_salt = base64.b64decode(container["pw_salt"])
+                    expected_aad = _build_aad(3, cipher, key_mode, kem_algo,
+                                              created_at, expires_at, shred_id, max_attempts)
+                    if "key_commitment" not in container:
+                        raise IntegrityError(
+                            "v3 container has no key commitment - refusing to decrypt "
+                            "(possible downgrade attack).")
+                    commitment = base64.b64decode(container["key_commitment"])
+            else:
+                raise IntegrityError(f"Unsupported container version: {version!r}")
 
-        recomputed = hashlib.sha256(plaintext).hexdigest()
-        integrity_ok = recomputed == container.get("sha256")
-        if not integrity_ok:
+            nonce = base64.b64decode(container["nonce"])
+            ciphertext = base64.b64decode(container["ciphertext"])
+            aad = base64.b64decode(container["aad"])
+        except IntegrityError:
+            raise
+        except (KeyError, TypeError, ValueError, AttributeError) as e:
+            raise IntegrityError(f"Malformed container: {type(e).__name__}: {e}") from e
+
+        # Header must match what was authenticated at encryption time.
+        if aad != expected_aad:
             raise IntegrityError(
-                f"SHA-256 mismatch: expected {container.get('sha256')}, got {recomputed}"
+                "Container header does not match its authenticated data - "
+                "the file was modified or tampered with."
             )
 
-        total_time = time.perf_counter() - t0
+        # ---- key expiry / crypto-shredding --------------------------------
+        # The sweep uses ONLY the local ledger (trusted), never the container's
+        # own claims - otherwise a crafted .pqc could make us destroy another
+        # file's key.
+        now = self.clock()
+        self.km.sweep_expired(now)
+        if expires_at is not None and now >= expires_at:
+            when = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(expires_at))
+            raise KeyShreddedError(
+                f"This file's key lifetime ended at {when}. Its key material has been "
+                "destroyed (crypto-shredded) - the data is permanently unrecoverable."
+            )
+
+        # ---- attempt budget / self-destruct --------------------------------
+        pw_key = None
+        entry = self.km.ledger().get(shred_id) if shred_id else None
+        if entry and entry.get("status") == "SHREDDED":
+            self.km._raise_missing(shred_id)
+        if entry and entry.get("max_attempts") and not max_attempts:
+            raise IntegrityError("Attempt guard missing from container header "
+                                 "(possible downgrade attack).")
+        if max_attempts:
+            if not entry or not entry.get("max_attempts"):
+                raise KeyStoreError("No local attempt-guard record for this file - it was "
+                                    "encrypted with a different keys/ folder.")
+            # Only the genuine container may spend this file's budget; a forged
+            # container naming someone else's shred_id cannot burn it.
+            if not hmac.compare_digest(base64.b64decode(entry["commitment"]), commitment):
+                raise IntegrityError("This container does not match the guarded key record.")
+            if not passphrase:
+                raise PassphraseRequiredError(
+                    f"This file is guarded: a passphrase is required. Only "
+                    f"{entry['max_attempts'] - int(entry.get('failed_attempts', 0))} wrong "
+                    "attempt(s) are allowed before its key is destroyed.")
+            with self.km._LEDGER_LOCK:
+                entry = self.km.ledger().get(shred_id)
+                if not entry or entry.get("status") != "ACTIVE":
+                    self.km._raise_missing(shred_id)
+                pw_key, verifier = _derive_pw(passphrase, pw_salt)
+                if hmac.compare_digest(verifier, base64.b64decode(entry["pw_verifier"])):
+                    self.km.reset_attempts(shred_id)
+                else:
+                    left, destroyed = self.km.record_failed_attempt(shred_id, now)
+                    if destroyed:
+                        raise KeyShreddedError(
+                            "Too many wrong passphrases. The attempt budget is used up and this "
+                            "file's key has been destroyed - the data is permanently unrecoverable.")
+                    raise WrongPassphraseError(
+                        f"Wrong passphrase. {left} attempt(s) left before this file's key "
+                        "is destroyed.", left)
+
+        t_key_start = time.perf_counter()
+        t_decaps = 0.0
+        try:
+            if key_mode == KEY_MODE_PQC:
+                _get_kem(kem_algo)  # rejects unknown / attacker-chosen algorithm names
+                dk = self.km.load_dk(kem_algo)
+                kem_ciphertext = base64.b64decode(container["kem_ciphertext"])
+                shred_key = self.km.load_shred_key(shred_id) if shred_id else None
+                t_d = time.perf_counter()
+                shared_secret = kem_decaps(kem_algo, dk, kem_ciphertext)
+                t_decaps = time.perf_counter() - t_d
+                data_key = _hkdf_derive_aes_key(shared_secret, salt=_mix_salt(shred_key, pw_key))
+            elif key_mode == KEY_MODE_CONVENTIONAL_MANAGED:
+                wrapped = base64.b64decode(container["wrapped_key"])
+                wrap_key = self.km.master_kek(create=False)
+                if shred_id:
+                    wrap_key = _hkdf_derive_aes_key(
+                        wrap_key, info=b"adaptive-pqc-v3-wrap",
+                        salt=_mix_salt(self.km.load_shred_key(shred_id), pw_key))
+                try:
+                    data_key = aes_key_unwrap(wrap_key, wrapped)
+                except InvalidUnwrap as e:
+                    raise IntegrityError(
+                        "Could not unwrap the file key - wrong master key or tampered container."
+                    ) from e
+            elif key_mode == KEY_MODE_CONVENTIONAL:
+                if shred_id is not None and shred_id != container.get("key_id"):
+                    raise IntegrityError("shred_id does not match key_id.")
+                data_key = self.km.load_conventional_key(container.get("key_id"))
+                if pw_key:
+                    data_key = _hkdf_derive_aes_key(data_key, info=b"adaptive-pqc-v3-pw", salt=pw_key)
+            else:
+                raise IntegrityError(f"Unknown key mode in container: {key_mode!r}")
+        except (KeyError, TypeError, ValueError, AssertionError) as e:
+            if isinstance(e, UnsupportedKEMError):
+                raise
+            raise IntegrityError(f"Malformed container: {type(e).__name__}: {e}") from e
+        key_recovery_time = time.perf_counter() - t_key_start
+
+        # ---- key commitment (v3) ------------------------------------------
+        commitment_verified = None
+        if version == 3:
+            aead_key, expected_commit = _derive_subkeys(data_key, aad, nonce)
+            if not hmac.compare_digest(expected_commit, commitment):
+                raise IntegrityError(
+                    "Key commitment check failed - wrong key, or the container was modified.")
+            commitment_verified = True
+        else:
+            aead_key = data_key
+
+        try:
+            plaintext = _make_aead(cipher, aead_key).decrypt(nonce, ciphertext, aad)
+        except UnsupportedCipherError:
+            raise
+        except Exception as e:
+            raise IntegrityError(f"Authenticated decryption failed: {e}") from e
+
+        recomputed = hashlib.sha256(plaintext).hexdigest()
+        if version == 3:
+            integrity_ok = True    # AEAD tag + key commitment both verified
+        else:
+            integrity_ok = recomputed == container.get("sha256")
+            if not integrity_ok:
+                raise IntegrityError(
+                    f"SHA-256 mismatch: expected {container.get('sha256')}, got {recomputed}"
+                )
+
         metrics = {
-            "decryption_time_s": total_time,
-            "kem_decapsulation_time_s": t_decaps,
+            "decryption_time_s": time.perf_counter() - t0,
+            "key_recovery_time_s": key_recovery_time,
+            "kem_decapsulation_time_s": t_decaps,   # 0.0 for non-PQC profiles
             "integrity_ok": integrity_ok,
+            "key_commitment_verified": commitment_verified,
             "sha256": recomputed,
+            "cipher": cipher,
+            "key_mode": key_mode,
+            "kem_algo": kem_algo,
+            "expires_at": expires_at,
+            "max_attempts": max_attempts,
         }
         return plaintext, metrics
 
-    def encrypt_file(self, in_path: Path, out_path: Path, kem_algo: str) -> dict:
+    # ------------------------------------------------------------------ files
+    def encrypt_file(self, in_path: Path, out_path: Path, profile,
+                     ttl_seconds: Optional[int] = None, max_attempts: Optional[int] = None,
+                     passphrase: Optional[str] = None) -> dict:
         data = in_path.read_bytes()
-        container, metrics = self.encrypt_bytes(data, kem_algo)
+        container, metrics = self.encrypt_bytes(data, profile, ttl_seconds=ttl_seconds,
+                                                label=in_path.name, max_attempts=max_attempts,
+                                                passphrase=passphrase)
         out_path.write_text(json.dumps(container))
         metrics["output_path"] = str(out_path)
+        metrics["output_name"] = out_path.name   # bare filename for download links (works on Windows too)
         return metrics
 
-    def decrypt_file(self, in_path: Path, out_path: Path) -> dict:
-        container = json.loads(in_path.read_text())
-        plaintext, metrics = self.decrypt_bytes(container)
+    def decrypt_file(self, in_path: Path, out_path: Path, passphrase: Optional[str] = None) -> dict:
+        try:
+            container = json.loads(in_path.read_text())
+        except (ValueError, UnicodeDecodeError) as e:
+            raise IntegrityError(f"Not a valid .pqc container: {e}") from e
+        if not isinstance(container, dict):
+            raise IntegrityError("Not a valid .pqc container.")
+        plaintext, metrics = self.decrypt_bytes(container, passphrase=passphrase)
         out_path.write_bytes(plaintext)
         metrics["output_path"] = str(out_path)
+        metrics["output_name"] = out_path.name   # bare filename for download links (works on Windows too)
         return metrics
 
 
@@ -1099,7 +1829,10 @@ def run_full_pipeline(file_path: Path, risk_model: RiskModel, engine: CryptoEngi
                        out_dir: Path = ENCRYPTED_DIR,
                        overrides: Optional[dict] = None,
                        risk_engine: str = "auto",
-                       groq_assessor: Optional[GroqRiskAssessor] = None) -> dict:
+                       groq_assessor: Optional[GroqRiskAssessor] = None,
+                       ttl_seconds: Optional[int] = None,
+                       max_attempts: Optional[int] = None,
+                       passphrase: Optional[str] = None) -> dict:
     """
     The only required input is `file_path`. All risk features are derived
     automatically from the file. Risk CLASSIFICATION is now performed by
@@ -1114,7 +1847,8 @@ def run_full_pipeline(file_path: Path, risk_model: RiskModel, engine: CryptoEngi
     profile = select_profile(risk_class)
 
     out_path = out_dir / (file_path.name + ".pqc")
-    enc_metrics = engine.encrypt_file(file_path, out_path, profile.kem_algo)
+    enc_metrics = engine.encrypt_file(file_path, out_path, profile, ttl_seconds=ttl_seconds,
+                                      max_attempts=max_attempts, passphrase=passphrase)
 
     orig_size = file_path.stat().st_size
     expansion_pct = (
@@ -1135,7 +1869,7 @@ def run_full_pipeline(file_path: Path, risk_model: RiskModel, engine: CryptoEngi
         "risk_reasoning": verdict["reasoning"],
         "risk_key_concerns": verdict["key_concerns"],
         "risk_feature_scores": verdict["feature_scores"],
-        "selected_profile": asdict(profile),
+        "selected_profile": profile_to_dict(profile),
         "encryption_metrics": enc_metrics,
         "ciphertext_expansion_pct": expansion_pct,
     }
@@ -1150,60 +1884,73 @@ def _make_test_bytes(size_bytes: int, seed: int) -> bytes:
     return rng.integers(0, 256, size=size_bytes, dtype=np.uint8).tobytes()
 
 
-def run_benchmark(sizes_kb=(1, 10, 100, 1024, 5120, 10240), reps: int = 5,
-                   kem_algos=("ML-KEM-512", "ML-KEM-768", "ML-KEM-1024")):
+def run_benchmark(sizes_kb=(1, 10, 100, 1024, 5120, 10240), reps: int = 5, profiles=None):
     """
-    Benchmarks each KEM x file size combination `reps` times.
-    Reports mean and standard deviation. No fabricated numbers: if the
-    KEM backend is unavailable, this raises rather than inventing data.
+    Benchmarks every security profile (LOW / MEDIUM / HIGH / CRITICAL) x
+    file size, `reps` times each. Reports mean and standard deviation.
+    No fabricated numbers: if the KEM backend is unavailable, this raises
+    rather than inventing data.
+
+    Runs against a throw-away key store so benchmarking never fills your
+    real keys/ folder with test keys.
     """
     import psutil
+    import tempfile
     process = psutil.Process(os.getpid())
-    engine = CryptoEngine()
-    engine.km.ensure_all()
+    profiles = list(profiles) if profiles else [SECURITY_PROFILES[c] for c in RISK_CLASSES]
 
     rows = []
-    for kem_algo in kem_algos:
-        for size_kb in sizes_kb:
-            size_bytes = size_kb * 1024
-            enc_times, dec_times, encaps_times, decaps_times = [], [], [], []
-            enc_sizes = []
-            mem_deltas = []
-            for r in range(reps):
-                data = _make_test_bytes(size_bytes, seed=RANDOM_SEED + r)
-                mem_before = process.memory_info().rss
-                container, enc_metrics = engine.encrypt_bytes(data, kem_algo)
-                mem_after = process.memory_info().rss
-                mem_deltas.append(mem_after - mem_before)
+    with tempfile.TemporaryDirectory() as tmp:
+        engine = CryptoEngine(KeyManager(Path(tmp)))
+        engine.km.ensure_all()
 
-                plaintext, dec_metrics = engine.decrypt_bytes(container)
-                assert plaintext == data, "roundtrip mismatch during benchmark"
+        for profile in profiles:
+            for size_kb in sizes_kb:
+                size_bytes = size_kb * 1024
+                enc_times, dec_times, encaps_times, decaps_times = [], [], [], []
+                key_setup_times, enc_sizes, mem_deltas = [], [], []
+                for r in range(reps):
+                    data = _make_test_bytes(size_bytes, seed=RANDOM_SEED + r)
+                    mem_before = process.memory_info().rss
+                    container, enc_metrics = engine.encrypt_bytes(data, profile)
+                    mem_after = process.memory_info().rss
+                    mem_deltas.append(mem_after - mem_before)
 
-                enc_times.append(enc_metrics["encryption_time_s"])
-                dec_times.append(dec_metrics["decryption_time_s"])
-                encaps_times.append(enc_metrics["kem_encapsulation_time_s"])
-                decaps_times.append(dec_metrics["kem_decapsulation_time_s"])
-                enc_sizes.append(enc_metrics["encrypted_size_bytes"])
+                    plaintext, dec_metrics = engine.decrypt_bytes(
+                        container, passphrase=enc_metrics.get("recovery_passphrase"))
+                    assert plaintext == data, "roundtrip mismatch during benchmark"
 
-            expansion_pct = (statistics.mean(enc_sizes) - size_bytes) / size_bytes * 100 if size_bytes else float("nan")
-            rows.append({
-                "kem_algo": kem_algo,
-                "file_size_kb": size_kb,
-                "reps": reps,
-                "enc_time_mean_s": statistics.mean(enc_times),
-                "enc_time_std_s": statistics.pstdev(enc_times) if reps > 1 else 0.0,
-                "dec_time_mean_s": statistics.mean(dec_times),
-                "dec_time_std_s": statistics.pstdev(dec_times) if reps > 1 else 0.0,
-                "kem_encaps_time_mean_s": statistics.mean(encaps_times),
-                "kem_decaps_time_mean_s": statistics.mean(decaps_times),
-                "original_size_bytes": size_bytes,
-                "encrypted_size_bytes_mean": statistics.mean(enc_sizes),
-                "ciphertext_expansion_pct": expansion_pct,
-                "memory_delta_bytes_mean": statistics.mean(mem_deltas),
-            })
-            print(f"[benchmark] {kem_algo:12s} {size_kb:6d} KB  "
-                  f"enc={rows[-1]['enc_time_mean_s']*1000:.3f}ms  "
-                  f"dec={rows[-1]['dec_time_mean_s']*1000:.3f}ms")
+                    enc_times.append(enc_metrics["encryption_time_s"])
+                    dec_times.append(dec_metrics["decryption_time_s"])
+                    encaps_times.append(enc_metrics["kem_encapsulation_time_s"])
+                    decaps_times.append(dec_metrics["kem_decapsulation_time_s"])
+                    key_setup_times.append(enc_metrics["key_setup_time_s"])
+                    enc_sizes.append(enc_metrics["encrypted_size_bytes"])
+
+                expansion_pct = (statistics.mean(enc_sizes) - size_bytes) / size_bytes * 100 if size_bytes else float("nan")
+                rows.append({
+                    "profile": profile.name,
+                    "cipher": profile.cipher,
+                    "key_protection": profile.key_protection,
+                    "kem_algo": profile.kem_algo or "none",
+                    "file_size_kb": size_kb,
+                    "reps": reps,
+                    "enc_time_mean_s": statistics.mean(enc_times),
+                    "enc_time_std_s": statistics.pstdev(enc_times) if reps > 1 else 0.0,
+                    "dec_time_mean_s": statistics.mean(dec_times),
+                    "dec_time_std_s": statistics.pstdev(dec_times) if reps > 1 else 0.0,
+                    "key_setup_time_mean_s": statistics.mean(key_setup_times),
+                    "kem_encaps_time_mean_s": statistics.mean(encaps_times),
+                    "kem_decaps_time_mean_s": statistics.mean(decaps_times),
+                    "original_size_bytes": size_bytes,
+                    "encrypted_size_bytes_mean": statistics.mean(enc_sizes),
+                    "ciphertext_expansion_pct": expansion_pct,
+                    "memory_delta_bytes_mean": statistics.mean(mem_deltas),
+                })
+                print(f"[benchmark] {profile.name:8s} {profile.cipher:18s} "
+                      f"{(profile.kem_algo or 'no-KEM'):12s} {size_kb:6d} KB  "
+                      f"enc={rows[-1]['enc_time_mean_s']*1000:.3f}ms  "
+                      f"dec={rows[-1]['dec_time_mean_s']*1000:.3f}ms")
 
     csv_path = RESULTS_DIR / "benchmark_results.csv"
     json_path = RESULTS_DIR / "benchmark_results.json"
@@ -1223,93 +1970,564 @@ def run_benchmark(sizes_kb=(1, 10, 100, 1024, 5120, 10240), reps: int = 5,
 # --------------------------------------------------------------------------
 
 def run_selftest() -> dict:
-    engine = CryptoEngine()
-    engine.km.ensure_all()
+    import tempfile
     results = {}
 
     def record(name, ok, detail=""):
         results[name] = {"passed": ok, "detail": detail}
         print(f"[selftest] {'PASS' if ok else 'FAIL'}  {name}  {detail}")
 
-    # 1. Roundtrip integrity
-    try:
-        data = b"hello adaptive pqc framework " * 100
-        container, _ = engine.encrypt_bytes(data, "ML-KEM-768")
-        recovered, m = engine.decrypt_bytes(container)
-        record("roundtrip_integrity", recovered == data and m["integrity_ok"])
-    except Exception as e:
-        record("roundtrip_integrity", False, str(e))
-
-    # 2. Tampered ciphertext should fail
-    try:
-        container, _ = engine.encrypt_bytes(b"tamper test payload", "ML-KEM-768")
-        raw = bytearray(base64.b64decode(container["ciphertext"]))
-        raw[0] ^= 0xFF
-        container["ciphertext"] = base64.b64encode(bytes(raw)).decode()
+    def check(name, fn):
         try:
-            engine.decrypt_bytes(container)
-            record("tampered_ciphertext_rejected", False, "decryption unexpectedly succeeded")
-        except IntegrityError:
-            record("tampered_ciphertext_rejected", True)
-    except Exception as e:
-        record("tampered_ciphertext_rejected", False, str(e))
+            out = fn()
+            ok, detail = out if isinstance(out, tuple) else (bool(out), "")
+            record(name, ok, detail)
+        except Exception as e:
+            record(name, False, f"{type(e).__name__}: {e}")
 
-    # 3. Wrong secret key should fail
-    try:
-        container, _ = engine.encrypt_bytes(b"wrong key test", "ML-KEM-512")
-        ek2, dk2 = kem_keygen("ML-KEM-512")  # unrelated fresh keypair
-        bad_km = KeyManager(KEYS_DIR)  # will still load the real dk unless we monkeypatch
-        # Simulate wrong key by swapping in a foreign secret key directly:
+    def raises(exc_types, fn) -> bool:
         try:
-            kem_decaps("ML-KEM-512", dk2, base64.b64decode(container["kem_ciphertext"]))
-            wrong_key_rejected = False  # some KEMs may "succeed" with garbage secret -> AES step should still fail
-        except Exception:
-            wrong_key_rejected = True
-        # Regardless of decaps behaviour, forging a container with dk2's ek should fail AES auth downstream.
-        record("wrong_secret_key_handling", True,
-               "decapsulation with foreign key does not leak the correct shared secret; "
-               "AES-GCM authentication provides the real safety net")
-    except Exception as e:
-        record("wrong_secret_key_handling", False, str(e))
+            fn()
+        except exc_types:
+            return True
+        return False
 
-    # 4. Wrong AAD should fail
-    try:
-        container, _ = engine.encrypt_bytes(b"aad test payload", "ML-KEM-768")
-        container["aad"] = base64.b64encode(b"tampered-aad").decode()
-        try:
-            engine.decrypt_bytes(container)
-            record("wrong_aad_rejected", False, "decryption unexpectedly succeeded")
-        except IntegrityError:
-            record("wrong_aad_rejected", True)
-    except Exception as e:
-        record("wrong_aad_rejected", False, str(e))
+    # Two independent key stores in throw-away folders: `engine` encrypts,
+    # `other` plays "a different machine / wrong keys". Your real keys/
+    # folder is never touched by the self-test.
+    with tempfile.TemporaryDirectory() as tmp_a, \
+         tempfile.TemporaryDirectory() as tmp_b, \
+         tempfile.TemporaryDirectory() as tmp_files:
+        engine = CryptoEngine(KeyManager(Path(tmp_a)), apply_attempt_policy=False)
+        engine.km.ensure_all()
+        other = CryptoEngine(KeyManager(Path(tmp_b)), apply_attempt_policy=False)
+        other.km.ensure_all()
+        profiles = [SECURITY_PROFILES[c] for c in RISK_CLASSES]
+        LOW, MEDIUM, HIGH, CRITICAL = profiles
 
-    # 5. Unsupported KEM -> clean error
-    try:
-        try:
-            _get_kem("ML-KEM-9999")
-            record("unsupported_kem_clean_error", False, "no exception raised")
-        except UnsupportedKEMError:
-            record("unsupported_kem_clean_error", True)
-    except Exception as e:
-        record("unsupported_kem_clean_error", False, str(e))
+        def flip_ciphertext(c):
+            raw = bytearray(base64.b64decode(c["ciphertext"]))
+            raw[0] ^= 0xFF
+            c = dict(c)
+            c["ciphertext"] = _b64e(bytes(raw))
+            return c
 
-    # 6. Empty file
-    try:
-        container, _ = engine.encrypt_bytes(b"", "ML-KEM-512")
-        recovered, m = engine.decrypt_bytes(container)
-        record("empty_file_roundtrip", recovered == b"" and m["integrity_ok"])
-    except Exception as e:
-        record("empty_file_roundtrip", False, str(e))
+        # 1. Risk class -> profile mapping matches the project design table
+        def t_mapping():
+            expected = {
+                "LOW": ("ChaCha20-Poly1305", KEY_MODE_CONVENTIONAL, None),
+                "MEDIUM": ("AES-256-GCM", KEY_MODE_CONVENTIONAL_MANAGED, None),
+                "HIGH": ("AES-256-GCM", KEY_MODE_PQC, "ML-KEM-768"),
+                "CRITICAL": ("AES-256-GCM", KEY_MODE_PQC, "ML-KEM-1024"),
+            }
+            got = {k: (select_profile(k).cipher, select_profile(k).key_mode,
+                       select_profile(k).kem_algo) for k in expected}
+            return got == expected, ""
+        check("profile_mapping_matches_design", t_mapping)
 
-    # 7. Larger binary payload (1 MB of random bytes)
-    try:
-        data = _make_test_bytes(1024 * 1024, seed=7)
-        container, _ = engine.encrypt_bytes(data, "ML-KEM-1024")
-        recovered, m = engine.decrypt_bytes(container)
-        record("large_binary_roundtrip_1mb", recovered == data and m["integrity_ok"])
-    except Exception as e:
-        record("large_binary_roundtrip_1mb", False, str(e))
+        # 2. Roundtrip + correct container shape for every profile
+        def t_roundtrip():
+            data = b"hello adaptive pqc framework " * 100
+            for p in profiles:
+                c, _ = engine.encrypt_bytes(data, p)
+                recovered, m = engine.decrypt_bytes(c)
+                if recovered != data or not m["integrity_ok"]:
+                    return False, f"{p.name}: roundtrip failed"
+                if c["cipher"] != p.cipher or c["key_mode"] != p.key_mode:
+                    return False, f"{p.name}: wrong header"
+                if ("kem_ciphertext" in c) != (p.key_mode == KEY_MODE_PQC):
+                    return False, f"{p.name}: unexpected KEM material"
+                if ("wrapped_key" in c) != (p.key_mode == KEY_MODE_CONVENTIONAL_MANAGED):
+                    return False, f"{p.name}: unexpected wrapped key"
+                if ("key_id" in c) != (p.key_mode == KEY_MODE_CONVENTIONAL):
+                    return False, f"{p.name}: unexpected key_id"
+            return True, ""
+        check("roundtrip_all_profiles", t_roundtrip)
+
+        # 3. Tampered ciphertext is rejected (every profile)
+        def t_tamper():
+            for p in profiles:
+                c, _ = engine.encrypt_bytes(b"tamper test payload", p)
+                if not raises(IntegrityError, lambda: engine.decrypt_bytes(flip_ciphertext(c))):
+                    return False, f"{p.name}: tampered ciphertext accepted"
+            return True, ""
+        check("tampered_ciphertext_rejected", t_tamper)
+
+        # 4. Header tampering / downgrade is rejected
+        def t_header():
+            for p in profiles:
+                c, _ = engine.encrypt_bytes(b"header test", p)
+                c2 = dict(c)
+                c2["cipher"] = CIPHER_CHACHA if p.cipher == CIPHER_AES else CIPHER_AES
+                if not raises(IntegrityError, lambda: engine.decrypt_bytes(c2)):
+                    return False, f"{p.name}: cipher swap accepted"
+            c, _ = engine.encrypt_bytes(b"downgrade test", HIGH)
+            c2 = dict(c)
+            c2["key_mode"] = KEY_MODE_CONVENTIONAL
+            if not raises(IntegrityError, lambda: engine.decrypt_bytes(c2)):
+                return False, "HIGH->conventional downgrade accepted"
+            c, _ = engine.encrypt_bytes(b"kem swap test", CRITICAL)
+            c2 = dict(c)
+            c2["kem_algo"] = "ML-KEM-768"
+            if not raises(IntegrityError, lambda: engine.decrypt_bytes(c2)):
+                return False, "CRITICAL->ML-KEM-768 swap accepted"
+            return True, ""
+        check("header_tamper_and_downgrade_rejected", t_header)
+
+        # 5. Wrong stored AAD is rejected
+        def t_aad():
+            for p in profiles:
+                c, _ = engine.encrypt_bytes(b"aad test payload", p)
+                c2 = dict(c)
+                c2["aad"] = _b64e(b"tampered-aad")
+                if not raises(IntegrityError, lambda: engine.decrypt_bytes(c2)):
+                    return False, f"{p.name}: wrong AAD accepted"
+            return True, ""
+        check("wrong_aad_rejected", t_aad)
+
+        # 6. Wrong keys: a different key store cannot decrypt
+        def t_wrong_keys():
+            data = b"wrong key test"
+            for p in (HIGH, CRITICAL):  # foreign store: no shred key / wrong ML-KEM key
+                c, _ = engine.encrypt_bytes(data, p)
+                if not raises((IntegrityError, KeyStoreError), lambda: other.decrypt_bytes(c)):
+                    return False, f"{p.name}: foreign ML-KEM key accepted"
+            c, _ = engine.encrypt_bytes(data, MEDIUM)  # different master key
+            if not raises((IntegrityError, KeyStoreError), lambda: other.decrypt_bytes(c)):
+                return False, "MEDIUM: foreign master key accepted"
+            c, _ = engine.encrypt_bytes(data, LOW)  # key_id unknown to other store
+            if not raises(KeyStoreError, lambda: other.decrypt_bytes(c)):
+                return False, "LOW: foreign key store accepted"
+            return True, ""
+        check("wrong_keys_rejected", t_wrong_keys)
+
+        # 7. Crafted key_id / kem_algo in an untrusted container cannot escape keys/
+        def t_untrusted_ids():
+            c, _ = engine.encrypt_bytes(b"x", LOW)
+            for bad in ("../../etc/passwd", "..\\..\\secret", "A" * 32, "", None):
+                c2 = dict(c)
+                c2["key_id"] = bad
+                if not raises(KeyStoreError, lambda: engine.decrypt_bytes(c2)):
+                    return False, f"key_id {bad!r} not rejected"
+            c, _ = engine.encrypt_bytes(b"x", HIGH)
+            c2 = dict(c)
+            c2["kem_algo"] = "..\\..\\evil"
+            c2["aad"] = _b64e(_aad_from_container(c2))
+            if not raises(UnsupportedKEMError, lambda: engine.decrypt_bytes(c2)):
+                return False, "crafted kem_algo not rejected"
+            return True, ""
+        check("untrusted_container_ids_rejected", t_untrusted_ids)
+
+        # 8. Unsupported algorithms -> clean errors
+        def t_unsupported():
+            ok1 = raises(UnsupportedKEMError, lambda: _get_kem("ML-KEM-9999"))
+            ok2 = raises(UnsupportedKEMError, lambda: engine.encrypt_bytes(b"x", "ML-KEM-9999"))
+            ok3 = raises(UnsupportedCipherError, lambda: _make_aead("ROT13", b"\0" * 32))
+            return ok1 and ok2 and ok3, ""
+        check("unsupported_algorithms_clean_error", t_unsupported)
+
+        # 9. Empty file, every profile
+        def t_empty():
+            for p in profiles:
+                c, _ = engine.encrypt_bytes(b"", p)
+                recovered, m = engine.decrypt_bytes(c)
+                if recovered != b"" or not m["integrity_ok"]:
+                    return False, p.name
+            return True, ""
+        check("empty_file_roundtrip", t_empty)
+
+        # 10. 1 MB binary payload, every profile
+        def t_large():
+            data = _make_test_bytes(1024 * 1024, seed=7)
+            for p in profiles:
+                c, _ = engine.encrypt_bytes(data, p)
+                recovered, m = engine.decrypt_bytes(c)
+                if recovered != data or not m["integrity_ok"]:
+                    return False, p.name
+            return True, ""
+        check("large_binary_roundtrip_1mb", t_large)
+
+        # 11. Real file on disk: encrypt_file -> .pqc -> decrypt_file
+        def t_files():
+            src = Path(tmp_files) / "sample.txt"
+            src.write_bytes(b"file on disk\n" * 50)
+            for p in profiles:
+                enc = Path(tmp_files) / f"sample_{p.name}.txt.pqc"
+                dec = Path(tmp_files) / f"sample_{p.name}.txt"
+                engine.encrypt_file(src, enc, p)
+                engine.decrypt_file(enc, dec)
+                if dec.read_bytes() != src.read_bytes():
+                    return False, p.name
+            return True, ""
+        check("file_roundtrip_all_profiles", t_files)
+
+        # 12. Containers written by the previous (v1, ML-KEM-only) version still decrypt
+        def t_legacy():
+            data = b"legacy v1 container"
+            algo = "ML-KEM-768"
+            shared_secret, kem_ct = kem_encaps(algo, engine.km.load_ek(algo))
+            nonce = os.urandom(12)
+            aad = f"1|{algo}".encode()
+            ct = AESGCM(_hkdf_derive_aes_key(shared_secret)).encrypt(nonce, data, aad)
+            c = {"version": 1, "kem_algo": algo, "aes_algo": "AES-256-GCM",
+                 "nonce": _b64e(nonce), "kem_ciphertext": _b64e(kem_ct),
+                 "ciphertext": _b64e(ct), "aad": _b64e(aad),
+                 "sha256": hashlib.sha256(data).hexdigest()}
+            recovered, m = engine.decrypt_bytes(c)
+            return recovered == data and m["integrity_ok"], ""
+        check("legacy_v1_container_still_decrypts", t_legacy)
+
+
+        # ------------------------------------------------------------------
+        # NEW: key commitment (container v3)
+        # ------------------------------------------------------------------
+        class FakeClock:
+            def __init__(self, t): self.t = float(t)
+            def __call__(self): return self.t
+
+        def _gf_mul(x, y):
+            R = 0xE1 << 120
+            z, v = 0, y
+            for i in range(127, -1, -1):
+                if (x >> i) & 1:
+                    z ^= v
+                v = (v >> 1) ^ R if v & 1 else v >> 1
+            return z
+
+        def _gf_inv(x):
+            r, b, e = 1 << 127, x, (1 << 128) - 2   # 1<<127 is the field's multiplicative identity (GCM bit order)
+            while e:
+                if e & 1:
+                    r = _gf_mul(r, b)
+                b = _gf_mul(b, b)
+                e >>= 1
+            return r
+
+        def _ghash(h, aad_b, blocks):
+            def pad(b): return b + b"\0" * (-len(b) % 16)
+            y = 0
+            data = pad(aad_b) + b"".join(blocks)
+            for i in range(0, len(data), 16):
+                y = _gf_mul(y ^ int.from_bytes(data[i:i + 16], "big"), h)
+            y = _gf_mul(y ^ ((len(aad_b) * 8) << 64 | (len(blocks) * 128)), h)
+            return y
+
+        def _gcm_two_key_ciphertext(k1, k2, nonce, aad_b):
+            """Craft ONE AES-GCM ciphertext+tag that authenticates under BOTH keys
+            (the 'key multiplication' attack behind partitioning-oracle attacks)."""
+            from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+            def ecb(k, blk):
+                e = Cipher(algorithms.AES(k), modes.ECB()).encryptor()
+                return e.update(blk) + e.finalize()
+            h1 = int.from_bytes(ecb(k1, bytes(16)), "big")
+            h2 = int.from_bytes(ecb(k2, bytes(16)), "big")
+            j0 = nonce + b"\0\0\0\1"
+            e1 = int.from_bytes(ecb(k1, j0), "big")
+            e2 = int.from_bytes(ecb(k2, j0), "big")
+            c1 = os.urandom(16)
+            def diff(x):
+                blocks = [c1, x.to_bytes(16, "big")]
+                return _ghash(h1, aad_b, blocks) ^ e1 ^ _ghash(h2, aad_b, blocks) ^ e2
+            coef = _gf_mul(h1, h1) ^ _gf_mul(h2, h2)       # difference is affine in x
+            x = _gf_mul(diff(0), _gf_inv(coef))
+            blocks = [c1, x.to_bytes(16, "big")]
+            tag = _ghash(h1, aad_b, blocks) ^ e1
+            return c1 + x.to_bytes(16, "big") + tag.to_bytes(16, "big")
+
+        def t_multikey():
+            k1, k2 = os.urandom(32), os.urandom(32)
+            nonce, aad_b = os.urandom(12), b"3|AES-256-GCM|header"
+            # (a) PLAIN AES-GCM is NOT key-committing: one ciphertext opens under both keys.
+            ct = _gcm_two_key_ciphertext(k1, k2, nonce, aad_b)
+            try:
+                AESGCM(k1).decrypt(nonce, ct, aad_b)
+                AESGCM(k2).decrypt(nonce, ct, aad_b)
+            except Exception as e:
+                return False, f"attack construction failed: {e}"
+            # (b) With the v3 commitment the two keys can never share a commitment,
+            #     so the same trick is caught before the AEAD is even run.
+            _, commit1 = _derive_subkeys(k1, aad_b, nonce)
+            _, commit2 = _derive_subkeys(k2, aad_b, nonce)
+            if hmac.compare_digest(commit1, commit2):
+                return False, "two different keys produced the same commitment"
+            return True, "plain GCM accepted the crafted ciphertext under 2 keys; commitment separates them"
+        check("key_commitment_blocks_multi_key_ciphertext", t_multikey)
+
+        def t_v3_shape():
+            c, m = engine.encrypt_bytes(b"shape test", HIGH)
+            if c["version"] != 3 or "key_commitment" not in c:
+                return False, "no key commitment in v3 container"
+            if len(base64.b64decode(c["key_commitment"])) != 32:
+                return False, "commitment is not 256-bit"
+            if "sha256" in c:
+                return False, "plaintext hash leaked in container"
+            return True, ""
+        check("v3_container_has_commitment_and_no_plaintext_hash", t_v3_shape)
+
+        def t_commit_tamper():
+            for p in profiles:
+                c, _ = engine.encrypt_bytes(b"commit tamper", p)
+                c2 = dict(c); raw = bytearray(base64.b64decode(c["key_commitment"])); raw[0] ^= 1
+                c2["key_commitment"] = _b64e(bytes(raw))
+                if not raises(IntegrityError, lambda: engine.decrypt_bytes(c2)):
+                    return False, f"{p.name}: flipped commitment accepted"
+                c3 = {k: v for k, v in c.items() if k != "key_commitment"}
+                if not raises(IntegrityError, lambda: engine.decrypt_bytes(c3)):
+                    return False, f"{p.name}: missing commitment accepted (downgrade)"
+            return True, ""
+        check("commitment_tamper_and_removal_rejected", t_commit_tamper)
+
+        # ------------------------------------------------------------------
+        # NEW: risk-driven key expiry + crypto-shredding (fake clock, no sleeping)
+        # ------------------------------------------------------------------
+        T0 = 1_800_000_000
+        clock = FakeClock(T0)
+        tdir = Path(tmp_files) / "ks_time"
+        teng = CryptoEngine(KeyManager(tdir), clock=clock, apply_attempt_policy=False)
+        teng.km.ensure_all()
+
+        def key_files_exist(c):
+            kid = c.get("shred_id") or c.get("key_id")
+            return ((teng.km.keys_dir / "shred" / f"{kid}.key").exists() or
+                    (teng.km.keys_dir / "conventional" / f"{kid}.key").exists())
+
+        def t_policy():
+            if not (KEY_LIFETIME_POLICY["MEDIUM"] > KEY_LIFETIME_POLICY["HIGH"]
+                    > KEY_LIFETIME_POLICY["CRITICAL"] > 0 and KEY_LIFETIME_POLICY["LOW"] is None):
+                return False, "policy is not monotone (higher risk => shorter lifetime)"
+            for name, prof in zip(RISK_CLASSES, profiles):
+                c, m = teng.encrypt_bytes(b"policy", prof)
+                ttl = KEY_LIFETIME_POLICY[name]
+                if ttl is None:
+                    if "expires_at" in c or "shred_id" in c:
+                        return False, f"{name}: should not expire"
+                else:
+                    if c.get("expires_at") != T0 + ttl:
+                        return False, f"{name}: wrong expiry"
+                    if teng.km.ledger().get(c["shred_id"], {}).get("status") != "ACTIVE":
+                        return False, f"{name}: not in ledger"
+            return True, ""
+        check("key_lifetime_policy_follows_risk_tier", t_policy)
+
+        def t_shred_lifecycle():
+            data = b"top secret payload " * 20
+            for prof in profiles:
+                clock.t = T0
+                c, _ = teng.encrypt_bytes(data, prof, ttl_seconds=100)
+                clock.t = T0 + 50
+                rec, m = teng.decrypt_bytes(c)
+                if rec != data or not m["key_commitment_verified"]:
+                    return False, f"{prof.name}: not readable before expiry"
+                clock.t = T0 + 101
+                if not raises(KeyShreddedError, lambda: teng.decrypt_bytes(c)):
+                    return False, f"{prof.name}: readable after expiry"
+                if key_files_exist(c):
+                    return False, f"{prof.name}: key material still on disk after expiry"
+                # the long-term keys are still there - shredding is per-file, not global
+                if prof.kem_algo and not teng.km._paths(prof.kem_algo)[1].exists():
+                    return False, "ML-KEM private key was destroyed"
+                if prof.key_mode == KEY_MODE_CONVENTIONAL_MANAGED and not (tdir / "master_kek.bin").exists():
+                    return False, "master key was destroyed"
+                # Setting the clock BACK must not resurrect the file.
+                clock.t = T0 + 10
+                if not raises(KeyShreddedError, lambda: teng.decrypt_bytes(c)):
+                    return False, f"{prof.name}: clock rollback resurrected the file"
+            return True, ""
+        check("expired_key_is_destroyed_and_file_unrecoverable", t_shred_lifecycle)
+
+        def t_sweep():
+            clock.t = T0
+            c1, _ = teng.encrypt_bytes(b"a", MEDIUM, ttl_seconds=10)
+            c2, _ = teng.encrypt_bytes(b"b", LOW, ttl_seconds=10)
+            c3, _ = teng.encrypt_bytes(b"c", HIGH, ttl_seconds=10_000)
+            clock.t = T0 + 11
+            done = teng.km.sweep_expired(clock.t)
+            ok = (set(done) == {c1["shred_id"], c2["shred_id"]}
+                  and not key_files_exist(c1) and not key_files_exist(c2) and key_files_exist(c3))
+            clock.t = T0
+            if ok and teng.decrypt_bytes(c3)[0] != b"c":
+                ok = False
+            return ok, f"swept {len(done)} expired key(s), kept the unexpired one"
+        check("sweep_destroys_only_expired_keys", t_sweep)
+
+        def t_expiry_tamper():
+            clock.t = T0
+            c, _ = teng.encrypt_bytes(b"expiry tamper", HIGH, ttl_seconds=100)
+            a = dict(c); a["expires_at"] = c["expires_at"] + 10**7           # header only
+            b = dict(a); b["aad"] = _b64e(_aad_from_container(b))             # header + aad
+            d = {k: v for k, v in c.items() if k not in ("expires_at", "created_at", "shred_id")}
+            d["aad"] = _b64e(_aad_from_container(d))                          # strip expiry entirely
+            for name, cc in (("extend", a), ("extend+aad", b), ("strip", d)):
+                if not raises(IntegrityError, lambda: teng.decrypt_bytes(cc)):
+                    return False, f"expiry {name} attack accepted"
+            return teng.decrypt_bytes(c)[0] == b"expiry tamper", ""
+        check("expiry_extension_or_removal_rejected", t_expiry_tamper)
+
+        def t_forged_shred():
+            clock.t = T0
+            victim, _ = teng.encrypt_bytes(b"victim data", MEDIUM, ttl_seconds=10_000)
+            c, _ = teng.encrypt_bytes(b"decoy", HIGH, ttl_seconds=10_000)
+            f = dict(c); f["shred_id"] = victim["shred_id"]
+            f["created_at"] = T0 - 100; f["expires_at"] = T0 - 1
+            f["aad"] = _b64e(_aad_from_container(f))
+            if not raises(KeyStoreError, lambda: teng.decrypt_bytes(f)):
+                return False, "forged expired container was processed"
+            if not key_files_exist(victim) or teng.decrypt_bytes(victim)[0] != b"victim data":
+                return False, "forged container destroyed another file's key"
+            return True, ""
+        check("forged_container_cannot_shred_other_files", t_forged_shred)
+
+        def t_ttl_override():
+            clock.t = T0
+            c, _ = teng.encrypt_bytes(b"x", CRITICAL, ttl_seconds=0)
+            if "expires_at" in c or "shred_id" in c:
+                return False, "ttl=0 should disable expiry"
+            c, _ = teng.encrypt_bytes(b"x", LOW, ttl_seconds=60)
+            if c.get("shred_id") != c.get("key_id") or c.get("expires_at") != T0 + 60:
+                return False, "LOW ttl override not applied"
+            if not raises(ValueError, lambda: teng.encrypt_bytes(b"x", LOW, ttl_seconds=-5)):
+                return False, "negative ttl accepted"
+            return True, ""
+        check("ttl_override_and_validation", t_ttl_override)
+
+        def t_legacy_v2():
+            key_id, key = engine.km.new_conventional_key()
+            data, nonce = b"legacy v2 container", os.urandom(12)
+            aad = _build_aad(2, CIPHER_CHACHA, KEY_MODE_CONVENTIONAL, None)
+            c = {"version": 2, "cipher": CIPHER_CHACHA, "key_mode": KEY_MODE_CONVENTIONAL,
+                 "kem_algo": None, "key_id": key_id, "nonce": _b64e(nonce),
+                 "ciphertext": _b64e(ChaCha20Poly1305(key).encrypt(nonce, data, aad)),
+                 "aad": _b64e(aad), "sha256": hashlib.sha256(data).hexdigest()}
+            rec, m = engine.decrypt_bytes(c)
+            return rec == data and m["integrity_ok"], ""
+        check("legacy_v2_container_still_decrypts", t_legacy_v2)
+
+
+        # ------------------------------------------------------------------
+        # NEW: risk-scaled self-destruct (attempt budget + passphrase gate)
+        # ------------------------------------------------------------------
+        gclock = FakeClock(T0)
+        gdir = Path(tmp_files) / "ks_guard"
+        geng = CryptoEngine(KeyManager(gdir), clock=gclock)   # per-tier budgets ON
+        geng.km.ensure_all()
+
+        def burn(c, limit=60):
+            """Guess wrong passphrases until the key self-destructs; return how many it took."""
+            for i in range(1, limit + 1):
+                try:
+                    geng.decrypt_bytes(c, passphrase=f"wrong-guess-{i}")
+                except WrongPassphraseError:
+                    continue
+                except KeyShreddedError:
+                    return i
+            return None
+
+        def t_budget_policy():
+            m = MAX_ATTEMPTS_POLICY
+            ok = (m["LOW"] is None and m["MEDIUM"] > m["HIGH"] > m["CRITICAL"] > 0)
+            return ok, "LOW=unlimited MEDIUM=%s HIGH=%s CRITICAL=%s" % (m["MEDIUM"], m["HIGH"], m["CRITICAL"])
+        check("attempt_budget_policy_follows_risk_tier", t_budget_policy)
+
+        def t_guard_roundtrip():
+            for prof in (MEDIUM, HIGH, CRITICAL):
+                c, m = geng.encrypt_bytes(b"guarded payload", prof)
+                pw = m.get("recovery_passphrase")
+                if not pw or c.get("max_attempts") != MAX_ATTEMPTS_POLICY[prof.name] or "pw_salt" not in c:
+                    return False, f"{prof.name}: guard not applied"
+                if not raises(PassphraseRequiredError, lambda: geng.decrypt_bytes(c)):
+                    return False, f"{prof.name}: opened without a passphrase"
+                if geng.km.ledger()[c["shred_id"]]["failed_attempts"] != 0:
+                    return False, f"{prof.name}: a missing passphrase was counted as an attempt"
+                rec, dm = geng.decrypt_bytes(c, passphrase=pw)
+                if rec != b"guarded payload" or not dm["key_commitment_verified"]:
+                    return False, f"{prof.name}: correct passphrase failed"
+            c, m = geng.encrypt_bytes(b"low", LOW)            # LOW: unguarded, no passphrase
+            if "max_attempts" in c or "recovery_passphrase" in m:
+                return False, "LOW should not be guarded"
+            return geng.decrypt_bytes(c)[0] == b"low", ""
+        check("guarded_tiers_need_passphrase_low_does_not", t_guard_roundtrip)
+
+        def t_self_destruct():
+            counts = {}
+            for prof in (MEDIUM, HIGH, CRITICAL):
+                c, m = geng.encrypt_bytes(b"self destruct " + prof.name.encode(), prof)
+                n = burn(c)
+                counts[prof.name] = n
+                if n != MAX_ATTEMPTS_POLICY[prof.name]:
+                    return False, f"{prof.name}: destroyed after {n} guesses, expected {MAX_ATTEMPTS_POLICY[prof.name]}"
+                kid = c["shred_id"]
+                if (gdir / "shred" / f"{kid}.key").exists():
+                    return False, f"{prof.name}: key still on disk"
+                # even the CORRECT passphrase is useless now
+                if not raises(KeyShreddedError, lambda: geng.decrypt_bytes(c, passphrase=m["recovery_passphrase"])):
+                    return False, f"{prof.name}: correct passphrase worked after self-destruct"
+                if prof.kem_algo and not geng.km._paths(prof.kem_algo)[1].exists():
+                    return False, "ML-KEM private key was destroyed (should be per-file only)"
+            return True, "guesses allowed: " + ", ".join(f"{k}={v}" for k, v in counts.items())
+        check("wrong_guesses_destroy_key_at_tier_budget", t_self_destruct)
+
+        def t_reset():
+            c, m = geng.encrypt_bytes(b"reset", CRITICAL)
+            pw = m["recovery_passphrase"]
+            for _ in range(2):
+                if not raises(WrongPassphraseError, lambda: geng.decrypt_bytes(c, passphrase="nope")):
+                    return False, "wrong passphrase not rejected"
+            geng.decrypt_bytes(c, passphrase=pw)                 # success resets the counter
+            for _ in range(2):
+                if not raises(WrongPassphraseError, lambda: geng.decrypt_bytes(c, passphrase="nope")):
+                    return False, "budget not reset after a correct passphrase"
+            return geng.decrypt_bytes(c, passphrase=pw)[0] == b"reset", ""
+        check("correct_passphrase_resets_attempt_counter", t_reset)
+
+        def t_guard_tamper():
+            c, m = geng.encrypt_bytes(b"guard tamper", CRITICAL)
+            pw = m["recovery_passphrase"]
+            a = dict(c); a["max_attempts"] = 1000                              # raise budget
+            b = dict(a); b["aad"] = _b64e(_aad_from_container(b))
+            d = {k: v for k, v in c.items() if k not in ("max_attempts", "pw_salt")}
+            d["aad"] = _b64e(_aad_from_container(d))                           # strip guard
+            for name, cc in (("raise", a), ("raise+aad", b), ("strip", d)):
+                if not raises(IntegrityError, lambda: geng.decrypt_bytes(cc, passphrase=pw)):
+                    return False, f"guard {name} attack accepted"
+            return geng.decrypt_bytes(c, passphrase=pw)[0] == b"guard tamper", ""
+        check("attempt_budget_cannot_be_raised_or_stripped", t_guard_tamper)
+
+        def t_forged_burn():
+            victim, vm = geng.encrypt_bytes(b"victim", HIGH)
+            decoy, _ = geng.encrypt_bytes(b"decoy", HIGH)
+            f = dict(decoy); f["shred_id"] = victim["shred_id"]
+            f["aad"] = _b64e(_aad_from_container(f))
+            for _ in range(15):
+                if not raises(IntegrityError, lambda: geng.decrypt_bytes(f, passphrase="guess")):
+                    return False, "forged container was processed"
+            if geng.km.ledger()[victim["shred_id"]]["failed_attempts"] != 0:
+                return False, "forged container spent the victim's budget"
+            return geng.decrypt_bytes(victim, passphrase=vm["recovery_passphrase"])[0] == b"victim", ""
+        check("forged_container_cannot_burn_other_files_budget", t_forged_burn)
+
+        def t_public_ledger():
+            c, _ = geng.encrypt_bytes(b"ledger", HIGH)
+            e = geng.km.public_ledger()[c["shred_id"]]
+            if "pw_verifier" in e or "commitment" in e:
+                return False, "secret fields exposed"
+            return e.get("max_attempts") == MAX_ATTEMPTS_POLICY["HIGH"], ""
+        check("public_ledger_hides_verifier", t_public_ledger)
+
+        def t_custom_pw_and_override():
+            c, m = geng.encrypt_bytes(b"mine", LOW, max_attempts=2, passphrase="correct horse")
+            if "recovery_passphrase" in m:
+                return False, "generated a passphrase although one was supplied"
+            if geng.decrypt_bytes(c, passphrase="correct horse")[0] != b"mine":
+                return False, "custom passphrase failed"
+            if burn(c) != 2:
+                return False, "LOW override budget not applied"
+            c, _ = geng.encrypt_bytes(b"x", CRITICAL, max_attempts=0)
+            if "max_attempts" in c or "shred_id" in c and "expires_at" not in c:
+                return False, "max_attempts=0 should disable the guard"
+            if not raises(ValueError, lambda: geng.encrypt_bytes(b"x", LOW, max_attempts=-1)):
+                return False, "negative budget accepted"
+            return True, ""
+        check("custom_passphrase_and_budget_override", t_custom_pw_and_override)
 
     n_pass = sum(1 for r in results.values() if r["passed"])
     print(f"\n[selftest] {n_pass}/{len(results)} checks passed")
@@ -1429,7 +2647,7 @@ INDEX_HTML = """
     <div class="logo">&#128272;</div>
     <div>
       <h1>Adaptive AI-Driven Post-Quantum File Encryption</h1>
-      <p>Risk-based security profiles &middot; Groq LLM risk assessment &middot; hybrid ML-KEM + AES-256-GCM</p>
+      <p>Risk-based security profiles &middot; Groq LLM risk assessment &middot; ChaCha20 / AES-256-GCM + ML-KEM key protection</p>
     </div>
   </div>
   <div class="status-pill">
@@ -1481,6 +2699,25 @@ INDEX_HTML = """
           <span class="t">Heuristic only</span>
           <div class="d">Local RandomForest, no network call</div>
         </label>
+      </div>
+
+      <div style="margin:16px 0 4px;font-size:13px;color:var(--muted);">
+        Key lifetime override (seconds, optional):
+        <input type="number" name="ttl_seconds" min="0" placeholder="risk-tier default"
+               style="width:150px;margin-left:6px;padding:6px 8px;border-radius:8px;border:1px solid var(--border,#2a3350);background:transparent;color:inherit;">
+        <div style="margin-top:4px;font-size:12px;">Leave blank to use the policy for the detected risk tier. 0 = never expire.
+        When the lifetime ends the key is destroyed and the file can no longer be decrypted.</div>
+      </div>
+
+      <div style="margin:14px 0 4px;font-size:13px;color:var(--muted);">
+        Attempt budget override (wrong passphrases before the key self-destructs, optional):
+        <input type="number" name="max_attempts" min="0" placeholder="risk-tier default"
+               style="width:150px;margin-left:6px;padding:6px 8px;border-radius:8px;border:1px solid var(--border,#2a3350);background:transparent;color:inherit;">
+        <div style="margin-top:8px;">Passphrase (optional):
+        <input type="password" name="passphrase" autocomplete="new-password" placeholder="auto-generate"
+               style="width:190px;margin-left:6px;padding:6px 8px;border-radius:8px;border:1px solid var(--border,#2a3350);background:transparent;color:inherit;"></div>
+        <div style="margin-top:4px;font-size:12px;">Files in guarded tiers (MEDIUM / HIGH / CRITICAL by default) need a passphrase to open.
+        If you leave it blank one is generated and shown once. 0 = unlimited attempts, no passphrase.</div>
       </div>
 
       <button type="submit">Analyze &amp; Encrypt</button>
@@ -1548,8 +2785,12 @@ INDEX_HTML = """
     <p class="sub">Chosen automatically from the risk class above.</p>
     <div class="stat-grid">
       <div class="stat"><div class="n">{{ result.selected_profile.name }}</div><div class="l">Profile</div></div>
-      <div class="stat"><div class="n">{{ result.selected_profile.aes_algo }}</div><div class="l">Symmetric cipher</div></div>
-      <div class="stat"><div class="n">{{ result.selected_profile.kem_algo }}</div><div class="l">PQC KEM</div></div>
+      <div class="stat"><div class="n">{{ result.selected_profile.cipher }}</div><div class="l">Symmetric cipher</div></div>
+      <div class="stat"><div class="n">{{ result.selected_profile.key_protection }}</div><div class="l">Key protection</div></div>
+      <div class="stat"><div class="n">{{ result.selected_profile.security_level }}</div><div class="l">Security level</div></div>
+      <div class="stat"><div class="n">{{ result.encryption_metrics.key_lifetime }}</div><div class="l">Key lifetime</div></div>
+      <div class="stat"><div class="n">256-bit</div><div class="l">Key commitment</div></div>
+      <div class="stat"><div class="n">{{ result.encryption_metrics.max_attempts or 'Unlimited' }}</div><div class="l">Wrong-passphrase budget</div></div>
     </div>
     <p class="sub" style="margin-top:12px;">{{ result.selected_profile.description }}</p>
   </div>
@@ -1561,9 +2802,26 @@ INDEX_HTML = """
       <div class="stat"><div class="n">{{ result.encryption_metrics.encrypted_size_bytes }} B</div><div class="l">Encrypted size</div></div>
       <div class="stat"><div class="n">{{ "%.2f"|format(result.ciphertext_expansion_pct) }}%</div><div class="l">Ciphertext expansion</div></div>
       <div class="stat"><div class="n">{{ "%.4f"|format(result.encryption_metrics.encryption_time_s) }}s</div><div class="l">Encryption time</div></div>
+      <div class="stat"><div class="n">{{ "%.4f"|format(result.encryption_metrics.key_setup_time_s) }}s</div><div class="l">Key setup</div></div>
+      {% if result.selected_profile.kem_algo %}
       <div class="stat"><div class="n">{{ "%.4f"|format(result.encryption_metrics.kem_encapsulation_time_s) }}s</div><div class="l">KEM encapsulation</div></div>
+      {% endif %}
+      {% if result.encryption_metrics.expires_at_text %}
+      <div class="stat"><div class="n" style="font-size:15px;">{{ result.encryption_metrics.expires_at_text }}</div><div class="l">Key destroyed at</div></div>
+      {% endif %}
     </div>
-    <a class="dl" style="margin-top:18px;" href="/download/{{ result.encryption_metrics.output_path.split('/')[-1] }}">&#11015; Download encrypted (.pqc) file</a>
+    {% if result.encryption_metrics.recovery_passphrase %}
+    <div class="banner" style="margin-top:14px;word-break:break-all;">
+      Passphrase for this file (shown once, not stored):
+      <strong>{{ result.encryption_metrics.recovery_passphrase }}</strong><br>
+      After {{ result.encryption_metrics.max_attempts }} wrong attempts the key is destroyed and the file is lost for good.
+    </div>
+    {% endif %}
+    {% if result.encryption_metrics.expires_at_text %}
+    <p class="sub" style="margin-top:12px;">After this time the key material is shredded and this file is permanently undecryptable.
+      Do not copy the keys/ folder if you rely on this guarantee.</p>
+    {% endif %}
+    <a class="dl" style="margin-top:18px;" href="/download/{{ result.encryption_metrics.output_name }}">&#11015; Download encrypted (.pqc) file</a>
   </div>
   {% endif %}
 
@@ -1576,24 +2834,32 @@ INDEX_HTML = """
         <div class="fname" id="fnameDec"></div>
       </label>
       <input type="file" name="file" id="fileInputDec" required>
+      <div style="margin:12px 0 4px;font-size:13px;color:var(--muted);">Passphrase (for guarded files):
+        <input type="password" name="passphrase" autocomplete="off"
+               style="width:210px;margin-left:6px;padding:6px 8px;border-radius:8px;border:1px solid var(--border,#2a3350);background:transparent;color:inherit;"></div>
       <button type="submit">Decrypt &amp; Verify</button>
     </form>
     {% if dec_result %}
     <div class="stat-grid" style="margin-top:18px;">
       <div class="stat"><div class="n">{{ "%.4f"|format(dec_result.decryption_time_s) }}s</div><div class="l">Decryption time</div></div>
+      <div class="stat"><div class="n">{{ dec_result.cipher }}</div><div class="l">Cipher used</div></div>
       <div class="stat"><div class="n {{ 'ok' if dec_result.integrity_ok else 'bad' }}">{{ 'VERIFIED' if dec_result.integrity_ok else 'FAILED' }}</div><div class="l">Integrity check</div></div>
+      {% if dec_result.key_commitment_verified %}
+      <div class="stat"><div class="n ok">VERIFIED</div><div class="l">Key commitment</div></div>
+      {% endif %}
     </div>
     <p class="sub" style="margin-top:10px;word-break:break-all;">SHA-256: {{ dec_result.sha256 }}</p>
-    <a class="dl" href="/download_decrypted/{{ dec_result.output_path.split('/')[-1] }}">&#11015; Download recovered file</a>
+    <a class="dl" href="/download_decrypted/{{ dec_result.output_name }}">&#11015; Download recovered file</a>
     {% endif %}
     {% if dec_error %}<div class="banner bad" style="margin-top:14px;">Decryption failed: {{ dec_error }}</div>{% endif %}
   </div>
 
 </div>
 <footer>
+  Key expiry destroys the local per-file key; it cannot protect copies of keys/ you have backed up elsewhere.<br>
   Academic research prototype — not a production security product.
-  Post-quantum KEM: pure-Python FIPS-203 ML-KEM (kyber-py), not liboqs.
-  Key storage under keys/ is local plaintext. Risk classification is
+  Post-quantum KEM (HIGH / CRITICAL profiles): pure-Python FIPS-203 ML-KEM (kyber-py), not liboqs.
+  LOW / MEDIUM use conventional symmetric keys. Key storage under keys/ is local plaintext. Risk classification is
   performed by an LLM (Groq) with a local RandomForest as an automatic
   offline fallback — see README for details.
 </footer>
@@ -1634,6 +2900,12 @@ INDEX_HTML = """
 """
 
 
+def _safe_name(filename: str) -> str:
+    """Strip any directory components from a client-supplied filename."""
+    name = Path((filename or "").replace("\\", "/")).name
+    return name or "upload.bin"
+
+
 def create_app():
     from flask import Flask, request, render_template_string, send_from_directory, abort, jsonify
 
@@ -1645,6 +2917,18 @@ def create_app():
     engine.km.ensure_all()
     groq_assessor = GroqRiskAssessor()
     groq_configured = bool(os.environ.get("GROQ_API_KEY"))
+
+    # Background crypto-shredder: destroys keys whose lifetime has ended even
+    # if nobody tries to open the file.
+    def _sweeper():
+        while True:
+            try:
+                engine.km.sweep_expired()
+            except Exception:
+                pass
+            time.sleep(15)
+    engine.km.sweep_expired()
+    threading.Thread(target=_sweeper, daemon=True, name="key-sweeper").start()
 
     def render_index(**kwargs):
         ctx = {
@@ -1679,13 +2963,36 @@ def create_app():
                            "Set GROQ_API_KEY (see README) or run: python main.py train"
             ), 400
 
-        save_path = UPLOADS_DIR / f.filename
+        ttl_raw = (request.form.get("ttl_seconds") or "").strip()
+        ttl_seconds = None
+        if ttl_raw:
+            try:
+                ttl_seconds = int(ttl_raw)
+                if ttl_seconds < 0:
+                    raise ValueError
+            except ValueError:
+                return render_index(enc_error="Key lifetime must be a whole number of seconds (0 = never)."), 400
+
+        att_raw = (request.form.get("max_attempts") or "").strip()
+        max_attempts = None
+        if att_raw:
+            try:
+                max_attempts = int(att_raw)
+                if max_attempts < 0:
+                    raise ValueError
+            except ValueError:
+                return render_index(enc_error="Attempt budget must be a whole number (0 = unlimited)."), 400
+        passphrase = request.form.get("passphrase") or None
+
+        save_path = UPLOADS_DIR / _safe_name(f.filename)
         f.save(save_path)
 
         try:
             result = run_full_pipeline(save_path, risk_model, engine,
                                         risk_engine=requested_engine,
-                                        groq_assessor=groq_assessor)
+                                        groq_assessor=groq_assessor,
+                                        ttl_seconds=ttl_seconds,
+                                        max_attempts=max_attempts, passphrase=passphrase)
         except KEMUnavailableError as e:
             return f"Post-quantum backend unavailable: {e}", 500
         except GroqUnavailableError as e:
@@ -1698,15 +3005,22 @@ def create_app():
         f = request.files.get("file")
         if not f or f.filename == "":
             return render_index(dec_error="No file uploaded"), 400
-        save_path = ENCRYPTED_DIR / f.filename
+        safe_name = _safe_name(f.filename)
+        save_path = ENCRYPTED_DIR / safe_name
         f.save(save_path)
-        out_name = f.filename[:-4] if f.filename.endswith(".pqc") else f.filename + ".decrypted"
+        out_name = safe_name[:-4] if safe_name.endswith(".pqc") else safe_name + ".decrypted"
         out_path = DECRYPTED_DIR / out_name
         try:
-            metrics = engine.decrypt_file(save_path, out_path)
+            metrics = engine.decrypt_file(save_path, out_path,
+                                           passphrase=request.form.get("passphrase") or None)
             return render_index(dec_result=metrics)
         except Exception as e:
             return render_index(dec_error=str(e))
+
+    @app.route("/api/keys")
+    def api_keys():
+        """Key-lifecycle ledger: id -> expiry / ACTIVE or SHREDDED (no key material)."""
+        return jsonify(engine.km.public_ledger())
 
     @app.route("/api/status")
     def api_status():
@@ -1768,9 +3082,22 @@ def main():
     p_encrypt.add_argument("--override-access-risk", type=float, default=None)
     p_encrypt.add_argument("--override-external-sharing", type=float, default=None)
 
+    p_encrypt.add_argument("--ttl-seconds", type=int, default=None,
+                            help="Key lifetime override in seconds (0 = never expire). "
+                                 "Default: the risk-tier policy (LOW none, MEDIUM 90d, HIGH 30d, CRITICAL 7d)")
+
+    p_encrypt.add_argument("--max-attempts", type=int, default=None,
+                            help="Wrong-passphrase budget before the key self-destructs "
+                                 "(0 = unlimited). Default: risk-tier policy "
+                                 "(LOW unlimited, MEDIUM 20, HIGH 10, CRITICAL 3)")
+    p_encrypt.add_argument("--passphrase", default=None,
+                            help="Passphrase for guarded files (default: auto-generated and shown once)")
+
     p_decrypt = sub.add_parser("decrypt", help="Decrypt a .pqc container")
     p_decrypt.add_argument("--file", required=True)
     p_decrypt.add_argument("--out", required=False)
+    p_decrypt.add_argument("--passphrase", default=None,
+                           help="Passphrase for guarded files (omit to be prompted securely)")
 
     p_bench = sub.add_parser("benchmark", help="Run KEM/AES benchmark suite")
     p_bench.add_argument("--sizes-kb", type=int, nargs="+",
@@ -1778,6 +3105,14 @@ def main():
     p_bench.add_argument("--reps", type=int, default=5)
 
     sub.add_parser("selftest", help="Run security validation checks")
+
+    sub.add_parser("sweep", help="Destroy (crypto-shred) every key whose lifetime has ended")
+
+    p_shred = sub.add_parser("shred", help="Crypto-shred a .pqc file NOW: destroy its per-file key")
+    p_shred.add_argument("--file", required=True)
+
+    p_inspect = sub.add_parser("inspect", help="Show a .pqc header + key lifetime status (no decryption)")
+    p_inspect.add_argument("--file", required=True)
 
     p_serve = sub.add_parser("serve", help="Run the Flask web dashboard")
     p_serve.add_argument("--port", type=int, default=5000)
@@ -1817,7 +3152,7 @@ def main():
             "fallback_reason": verdict["fallback_reason"],
             "reasoning": verdict["reasoning"],
             "key_concerns": verdict["key_concerns"],
-            "selected_profile": asdict(profile),
+            "selected_profile": profile_to_dict(profile),
         }, indent=2))
 
     elif args.command == "encrypt":
@@ -1834,14 +3169,30 @@ def main():
         }
         groq_assessor = GroqRiskAssessor(api_key=args.groq_api_key, model=args.groq_model)
         result = run_full_pipeline(Path(args.file), rm, engine, overrides=overrides,
-                                    risk_engine=args.engine, groq_assessor=groq_assessor)
+                                    risk_engine=args.engine, groq_assessor=groq_assessor,
+                                    ttl_seconds=args.ttl_seconds,
+                                    max_attempts=args.max_attempts, passphrase=args.passphrase)
+        if result["encryption_metrics"].get("recovery_passphrase"):
+            print("\n*** Passphrase for this file (shown once, not stored): "
+                  f"{result['encryption_metrics']['recovery_passphrase']} ***", file=sys.stderr)
         print(json.dumps(result, indent=2))
 
     elif args.command == "decrypt":
         engine = CryptoEngine()
         in_path = Path(args.file)
         out_path = Path(args.out) if args.out else DECRYPTED_DIR / in_path.stem
-        metrics = engine.decrypt_file(in_path, out_path)
+        try:
+            try:
+                metrics = engine.decrypt_file(in_path, out_path, passphrase=args.passphrase)
+            except PassphraseRequiredError:
+                if not sys.stdin.isatty():
+                    raise
+                import getpass
+                metrics = engine.decrypt_file(in_path, out_path,
+                                              passphrase=getpass.getpass("Passphrase: "))
+        except (IntegrityError, KeyStoreError, UnsupportedKEMError, UnsupportedCipherError) as e:
+            print(f"Decryption failed: {e}", file=sys.stderr)
+            sys.exit(1)
         print(json.dumps(metrics, indent=2))
 
     elif args.command == "benchmark":
@@ -1849,6 +3200,43 @@ def main():
 
     elif args.command == "selftest":
         run_selftest()
+
+    elif args.command == "sweep":
+        km = KeyManager()
+        done = km.sweep_expired()
+        print(json.dumps({"shredded": done, "count": len(done)}, indent=2))
+
+    elif args.command in ("shred", "inspect"):
+        try:
+            c = json.loads(Path(args.file).read_text())
+            assert isinstance(c, dict)
+        except Exception as e:
+            print(f"Not a valid .pqc container: {e}", file=sys.stderr)
+            sys.exit(2)
+        km = KeyManager()
+        kid = c.get("shred_id") or c.get("key_id")
+        entry = km.ledger().get(kid) if kid else None
+        if args.command == "inspect":
+            exp = c.get("expires_at")
+            print(json.dumps({
+                "version": c.get("version", 1), "cipher": c.get("cipher"),
+                "key_mode": c.get("key_mode"), "kem_algo": c.get("kem_algo"),
+                "key_commitment": "present" if "key_commitment" in c else "absent (pre-v3)",
+                "expires_at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(exp)) if exp else None,
+                "seconds_remaining": max(0, int(exp - time.time())) if exp else None,
+                "ledger_status": entry.get("status") if entry else None,
+                "max_attempts": c.get("max_attempts"),
+                "attempts_left": (entry["max_attempts"] - entry.get("failed_attempts", 0))
+                                 if entry and entry.get("max_attempts") and entry.get("status") == "ACTIVE" else None,
+            }, indent=2))
+        else:
+            if not kid:
+                print("This container has no per-file key to destroy. Only containers made with a "
+                      "key lifetime (v3) or LOW-tier files can be shredded individually.", file=sys.stderr)
+                sys.exit(2)
+            destroyed = km.shred(kid, reason="manual")
+            print(json.dumps({"shredded_id": kid, "key_material_destroyed": destroyed,
+                              "note": "The file can no longer be decrypted."}, indent=2))
 
     elif args.command == "serve":
         app = create_app()
